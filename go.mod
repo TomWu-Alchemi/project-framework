@@ -1,4 +1,4 @@
-module ai-kaka.com/project-framework
+module github.com/TomWu-Alchemi/project-framework
 
 go 1.24.9
 

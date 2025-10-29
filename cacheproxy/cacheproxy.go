@@ -1,9 +1,9 @@
 package cacheproxy
 
 import (
-	"ai-kaka.com/project-framework/logger"
 	"context"
 	"errors"
+	"github.com/TomWu-Alchemi/project-framework/logger"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 	"sync"
