@@ -33,15 +33,17 @@ func (f MissedGetterFunc) Get(ctx context.Context, missedKey []string) (map[stri
 }
 
 const (
-	defaultExpiredTime = 24 * time.Hour
-	defaultRefreshTime = 10 * time.Minute
+	defaultExpiredTime      = 24 * time.Hour
+	defaultEmptyExpiredTime = time.Minute
+	defaultRefreshTime      = 10 * time.Minute
 )
 
 var (
 	once         sync.Once
 	defaultProxy *CacheProxy
 
-	fastRequeryErr = errors.New("need fast requery")
+	fastRequeryErr    = errors.New("need fast requery")
+	ErrNotInitialized = errors.New("cacheproxy: not initialized, call Init first")
 )
 
 type CacheProxy struct {
@@ -77,11 +79,11 @@ func newCacheProxy(rdb *redis.Client) *CacheProxy {
 
 // GetHit string：存储值，bool：是否在缓存中找到，error：错误
 func (p *CacheProxy) GetHit(ctx context.Context, c CacheContext, key string, getter SingleGetter) (string, bool, error) {
-	if p == nil {
-		panic("empty cacheProxy")
+	if err := p.ready(); err != nil {
+		return "", false, err
 	}
-	if len(key) == 0 {
-		return "", false, nil
+	if key == "" {
+		return "", false, ErrInvalidKey
 	}
 	// 强制刷新，不查询缓存，只回源并对缓存赋值
 	if c.NeedForceRefresh {
@@ -89,9 +91,8 @@ func (p *CacheProxy) GetHit(ctx context.Context, c CacheContext, key string, get
 		if err != nil {
 			return "", false, err
 		}
-		err = p.setData(context.Background(), c, key, data, needFastRequery)
-		if err != nil {
-			return "", false, err
+		if err = p.setData(context.Background(), c, key, data, needFastRequery); err != nil {
+			logger.Errorf("cacheProxy force setData err: %v", err)
 		}
 		return data, false, nil
 	}
@@ -149,22 +150,30 @@ func (p *CacheProxy) GetHit(ctx context.Context, c CacheContext, key string, get
 }
 
 func (p *CacheProxy) Set(ctx context.Context, c CacheContext, key string, value string) error {
-	if p == nil {
-		panic("empty cacheProxy")
+	if err := p.ready(); err != nil {
+		return err
 	}
 	return p.setData(ctx, c, key, value, false)
 }
 
 func (p *CacheProxy) Remove(ctx context.Context, c CacheContext, key string) error {
-	if p == nil {
-		panic("empty cacheProxy")
+	if err := p.ready(); err != nil {
+		return err
 	}
 	return p.cache.Remove(ctx, key)
 }
 
+func (p *CacheProxy) ready() error {
+	if p == nil {
+		return ErrNotInitialized
+	}
+	return nil
+}
+
 func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleGetter) (string, bool, error) {
-	val, err, _ := p.getGroup.Do(key, func() (interface{}, error) {
-		data, needFastRequery, getErr := getter.Get(ctx, key)
+	flightCtx := context.WithoutCancel(ctx)
+	val, err, _ := p.getGroup.Do(key, func() (any, error) {
+		data, needFastRequery, getErr := getter.Get(flightCtx, key)
 		if getErr != nil {
 			return nil, getErr
 		}
@@ -175,6 +184,9 @@ func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleG
 	})
 	if err != nil && !errors.Is(err, fastRequeryErr) {
 		return "", false, err
+	}
+	if ctx.Err() != nil {
+		return "", false, ctx.Err()
 	}
 	res, ok := val.(string)
 	if !ok {
@@ -193,5 +205,15 @@ func (p *CacheProxy) setData(ctx context.Context, c CacheContext, key string, da
 		IsNil:           false,
 		Data:            data,
 	}
-	return p.cache.Set(ctx, key, sv, c.ExpiredTime, c.EmptyExpiredTime)
+	return p.cache.Set(ctx, key, sv,
+		durationOrDefault(c.ExpiredTime, defaultExpiredTime),
+		durationOrDefault(c.EmptyExpiredTime, defaultEmptyExpiredTime),
+	)
+}
+
+func durationOrDefault(d, fallback time.Duration) time.Duration {
+	if d <= 0 {
+		return fallback
+	}
+	return d
 }

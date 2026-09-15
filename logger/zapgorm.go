@@ -31,7 +31,7 @@ func NewGormLogger(zapLogger *zap.Logger) Logger {
 		LogLevel:                  gormlogger.Warn,
 		SlowThreshold:             100 * time.Millisecond,
 		SkipCallerLookup:          false,
-		IgnoreRecordNotFoundError: false,
+		IgnoreRecordNotFoundError: true,
 		Context:                   nil,
 	}
 }
@@ -55,7 +55,7 @@ func (l Logger) Info(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Info {
 		return
 	}
-	l.logger(ctx).Sugar().Debugf(str, args...)
+	l.logger(ctx).Sugar().Infof(str, args...)
 }
 
 func (l Logger) Warn(ctx context.Context, str string, args ...interface{}) {
@@ -87,13 +87,13 @@ func (l Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, i
 		logger.Warn("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
 	case l.LogLevel >= gormlogger.Info:
 		sql, rows := fc()
-		logger.Debug("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
+		logger.Info("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
 	}
 }
 
 var (
 	gormPackage    = filepath.Join("gorm.io", "gorm")
-	zapgormPackage = filepath.Join("moul.io", "zapgorm2")
+	zapgormPackage = filepath.Join("github.com", "TomWu-Alchemi", "project-framework", "logger")
 )
 
 func (l Logger) logger(ctx context.Context) *zap.Logger {
@@ -114,6 +114,7 @@ func (l Logger) logger(ctx context.Context) *zap.Logger {
 		case strings.HasSuffix(file, "_test.go"):
 		case strings.Contains(file, gormPackage):
 		case strings.Contains(file, zapgormPackage):
+		case strings.HasSuffix(file, "zapgorm.go"):
 		default:
 			return logger.WithOptions(zap.AddCallerSkip(i))
 		}

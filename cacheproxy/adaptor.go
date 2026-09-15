@@ -3,9 +3,11 @@ package cacheproxy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
+
 	"github.com/bytedance/sonic"
 	"github.com/redis/go-redis/v9"
-	"time"
 )
 
 type Cache interface {
@@ -19,6 +21,7 @@ type Cache interface {
 var (
 	ErrInvalidKey     = errors.New("empty key")
 	ErrMismatchedPair = errors.New(" keys and values mismatch")
+	ErrNilRedis       = errors.New("cacheproxy: empty redis client")
 )
 
 type RedisCache struct {
@@ -30,11 +33,11 @@ func NewRedisAdaptor(rdb *redis.Client) *RedisCache {
 }
 
 func (c *RedisCache) Get(ctx context.Context, key string) (StringView, bool, error) {
-	if c.rdb == nil {
-		panic("empty redis client")
-	}
 	res := StringView{}
-	if len(key) < 0 {
+	if err := c.ready(); err != nil {
+		return res, false, err
+	}
+	if key == "" {
 		return res, false, ErrInvalidKey
 	}
 	result, err := c.rdb.Get(ctx, key).Result()
@@ -52,10 +55,10 @@ func (c *RedisCache) Get(ctx context.Context, key string) (StringView, bool, err
 }
 
 func (c *RedisCache) Set(ctx context.Context, key string, value StringView, expiredTime time.Duration, emptyExpiredTime time.Duration) error {
-	if c.rdb == nil {
-		panic("empty redis client")
+	if err := c.ready(); err != nil {
+		return err
 	}
-	if len(key) <= 0 {
+	if key == "" {
 		return ErrInvalidKey
 	}
 	valStr, err := sonic.MarshalString(value)
@@ -71,22 +74,31 @@ func (c *RedisCache) Set(ctx context.Context, key string, value StringView, expi
 }
 
 func (c *RedisCache) Remove(ctx context.Context, key string) error {
-	if c.rdb == nil {
-		panic("empty redis client")
+	if err := c.ready(); err != nil {
+		return err
 	}
-	if len(key) <= 0 {
+	if key == "" {
 		return ErrInvalidKey
 	}
 	_, err := c.rdb.Del(ctx, key).Result()
 	return err
 }
 
-func (c *RedisCache) MGet(ctx context.Context, keys []string) ([]StringView, error) {
-	//TODO implement me
-	return nil, nil
+func (c *RedisCache) MGet(_ context.Context, _ []string) ([]StringView, error) {
+	return nil, fmtUnsupported("MGet")
 }
 
-func (c *RedisCache) MSet(ctx context.Context, keys []string, values []StringView, expiredTime time.Duration, emptyExpiredTime time.Duration) error {
-	//TODO implement me
+func (c *RedisCache) MSet(_ context.Context, _ []string, _ []StringView, _ time.Duration, _ time.Duration) error {
+	return fmtUnsupported("MSet")
+}
+
+func (c *RedisCache) ready() error {
+	if c == nil || c.rdb == nil {
+		return ErrNilRedis
+	}
 	return nil
+}
+
+func fmtUnsupported(op string) error {
+	return fmt.Errorf("cacheproxy: %s: %w", op, errors.ErrUnsupported)
 }

@@ -11,16 +11,14 @@ type StringView struct {
 
 func (v StringView) IsExpire(normalOffset time.Duration, fastOffset time.Duration) bool {
 	if v.Ctime.IsZero() {
-		return false
+		return true
 	}
 	offset := normalOffset
 	if v.NeedFastRequery {
-		offset = fastOffset
+		offset = durationOrDefault(fastOffset, normalOffset)
 	}
-	if v.Ctime.Add(offset).Before(time.Now()) {
-		return true
-	}
-	return false
+	offset = durationOrDefault(offset, defaultRefreshTime)
+	return v.Ctime.Add(offset).Before(time.Now())
 }
 
 func (v StringView) Len() int {

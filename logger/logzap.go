@@ -83,11 +83,23 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 		// some evil middlewares modify this values
 		path := c.Request.URL.Path
 		query := c.Request.URL.RawQuery
+		skipByPath := skipPaths[path]
+		if !skipByPath {
+			for _, reg := range conf.SkipPathRegexps {
+				if reg.MatchString(path) {
+					skipByPath = true
+					break
+				}
+			}
+		}
+
 		bodyStr := ""
-		if c.Request.Body != nil {
-			body, _ := io.ReadAll(c.Request.Body)
-			bodyStr = string(body)
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+		var bodyReadErr error
+		var bodyTruncatedAtRead bool
+		if !skipByPath {
+			var logged []byte
+			logged, bodyTruncatedAtRead, bodyReadErr = snapshotRequestBody(c.Request)
+			bodyStr = string(logged)
 			mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 			if err == nil {
 				switch mediaType {
@@ -99,21 +111,9 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			}
 		}
 		c.Next()
-		track := true
-
-		if _, ok := skipPaths[path]; ok || (conf.Skipper != nil && conf.Skipper(c)) {
+		track := !skipByPath
+		if track && conf.Skipper != nil && conf.Skipper(c) {
 			track = false
-		}
-
-		if track && len(conf.SkipPathRegexps) > 0 {
-			for _, reg := range conf.SkipPathRegexps {
-				if !reg.MatchString(path) {
-					continue
-				}
-
-				track = false
-				break
-			}
 		}
 
 		if track {
@@ -139,8 +139,17 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			if conf.TimeFormat != "" {
 				fields = append(fields, zap.String("time", end.Format(conf.TimeFormat)))
 			}
-			if len(bodyStr) > 0 {
+			if bodyReadErr != nil {
+				fields = append(fields, zap.Error(bodyReadErr))
+			}
+			if len(bodyStr) > 0 || bodyTruncatedAtRead {
 				loggedBody, bodyTruncated, bodySize := truncateString(bodyStr)
+				if bodyTruncatedAtRead {
+					bodyTruncated = true
+					if cl := c.Request.ContentLength; cl > int64(bodySize) {
+						bodySize = int(cl)
+					}
+				}
 				fields = append(fields,
 					zap.String("body", loggedBody),
 					zap.Bool("body_truncated", bodyTruncated),
@@ -168,6 +177,36 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			}
 		}
 	}
+}
+
+type bodyRestore struct {
+	io.Reader
+	c io.Closer
+}
+
+func (b bodyRestore) Close() error {
+	if b.c == nil {
+		return nil
+	}
+	return b.c.Close()
+}
+
+// snapshotRequestBody copies at most maxLogBytes+1 from the request for logging,
+// then restores the full body (prefix + remainder) for downstream handlers.
+func snapshotRequestBody(r *http.Request) ([]byte, bool, error) {
+	if r == nil || r.Body == nil {
+		return nil, false, nil
+	}
+	orig := r.Body
+	buf, err := io.ReadAll(io.LimitReader(orig, int64(maxLogBytes)+1))
+	r.Body = bodyRestore{Reader: io.MultiReader(bytes.NewReader(buf), orig), c: orig}
+	if err != nil {
+		return buf, false, err
+	}
+	if len(buf) > maxLogBytes {
+		return buf[:maxLogBytes], true, nil
+	}
+	return buf, false, nil
 }
 
 func filterSensitiveData(body string) string {

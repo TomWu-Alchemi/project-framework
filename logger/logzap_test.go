@@ -147,3 +147,67 @@ func TestTruncateString(t *testing.T) {
 		t.Fatalf("len=%d trunc=%v size=%d", len(logged), trunc, size)
 	}
 }
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("read fail") }
+
+func TestGinzap_SkipPathsDoesNotLogBody(t *testing.T) {
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(GinzapWithConfig(zl, &Config{SkipPaths: []string{"/health"}, DefaultLevel: zapcore.InfoLevel}))
+	r.POST("/health", func(c *gin.Context) {
+		got, _ := io.ReadAll(c.Request.Body)
+		if string(got) != "ping-body" {
+			t.Errorf("handler body=%q", got)
+		}
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/health", strings.NewReader("ping-body"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if buf.Len() != 0 {
+		t.Fatalf("skip path should not log, got %s", buf.String())
+	}
+}
+
+func TestGinzap_LargeBodyRestoredAndTruncated(t *testing.T) {
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(Ginzap(zl, "", false))
+	body := strings.Repeat("x", maxLogBytes+2048)
+	r.POST("/x", func(c *gin.Context) {
+		got, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			t.Errorf("handler read: %v", err)
+		}
+		if len(got) != len(body) {
+			t.Errorf("handler got %d bytes, want %d", len(got), len(body))
+		}
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	out := buf.String()
+	if !strings.Contains(out, `"body_truncated":true`) {
+		t.Fatalf("expected truncated flag: %s", out)
+	}
+}
+
+func TestSnapshotRequestBody_ReadErrorRestores(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req.Body = io.NopCloser(errReader{})
+	logged, truncated, err := snapshotRequestBody(req)
+	if err == nil || err.Error() != "read fail" {
+		t.Fatalf("err=%v", err)
+	}
+	if truncated || len(logged) != 0 {
+		t.Fatalf("logged=%q truncated=%v", logged, truncated)
+	}
+	got, readErr := io.ReadAll(req.Body)
+	if readErr == nil || readErr.Error() != "read fail" {
+		t.Fatalf("restored read err=%v body=%q", readErr, got)
+	}
+}
