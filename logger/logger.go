@@ -60,7 +60,7 @@ func InitLogger() {
 	errorFileCore := zapcore.NewCore(encoder, zapcore.NewMultiWriteSyncer(errorFileWriteSyncer, zapcore.AddSync(os.Stdout)), highPriority)
 
 	coreArr = append(coreArr, infoFileCore, errorFileCore)
-	log = zap.New(zapcore.NewTee(coreArr...), zap.AddCaller()).Sugar()
+	log = zap.New(zapcore.NewTee(coreArr...), zap.AddCaller(), zap.AddCallerSkip(1)).Sugar()
 
 	accessLoggerWriter := &lumberjack.Logger{
 		Filename:   getAbsPath("./log/access/access.log"),
@@ -101,7 +101,7 @@ func InitLogger() {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				Error("panic in log rotating: %v, stack: %s", r, debug.Stack())
+				Errorf("panic in log rotating: %v, stack: %s", r, debug.Stack())
 			}
 		}()
 		for {
@@ -124,18 +124,51 @@ func InitLogger() {
 }
 
 func Info(args ...interface{}) {
-	log.Info(args)
+	if log == nil {
+		return
+	}
+	log.Info(args...)
 }
 
 func Warn(args ...interface{}) {
-	log.Warn(args)
+	if log == nil {
+		return
+	}
+	log.Warn(args...)
 }
 
 func Error(args ...interface{}) {
-	log.Error(args)
+	if log == nil {
+		return
+	}
+	log.Error(args...)
+}
+
+func Infof(template string, args ...any) {
+	if log == nil {
+		return
+	}
+	log.Infof(template, args...)
+}
+
+func Warnf(template string, args ...any) {
+	if log == nil {
+		return
+	}
+	log.Warnf(template, args...)
+}
+
+func Errorf(template string, args ...any) {
+	if log == nil {
+		return
+	}
+	log.Errorf(template, args...)
 }
 
 func StackedError(err error) {
+	if log == nil {
+		return
+	}
 	log.Error(fmt.Sprintf("[%+v]", err))
 }
 

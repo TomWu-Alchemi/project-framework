@@ -1,18 +1,20 @@
 package rpc
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"runtime/debug"
+	"strings"
+	"time"
+
 	"github.com/TomWu-Alchemi/project-framework/logger"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
 	errors2 "github.com/pkg/errors"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-	"runtime/debug"
-	"strings"
-	"time"
 )
+
+const maxLogBytes = 256 << 10
 
 type NatsService struct {
 	nc  *nats.Conn
@@ -32,7 +34,7 @@ func NewNatsService(config ServiceConfig) (*NatsService, func(), error) {
 	nc, err := nats.Connect(config.Url,
 		nats.UserInfo(config.Username, config.Password),
 		nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
-			logger.Error(fmt.Sprintf("nats rpc disconnect error occur, err(%v）", err))
+			logger.Errorf("nats rpc disconnect error occur, err(%v)", err)
 		}),
 		nats.DrainTimeout(config.DrainTimeout))
 	if err != nil {
@@ -43,10 +45,11 @@ func NewNatsService(config ServiceConfig) (*NatsService, func(), error) {
 		Name:    config.AppName,
 		Version: config.Version,
 		ErrorHandler: func(service micro.Service, natsError *micro.NATSError) {
-			logger.Error("srv(%s) version(%s) error occurred, err(%v)", service.Info().Name, service.Info().Version, natsError.Error())
+			logger.Errorf("srv(%s) version(%s) error occurred, err(%v)", service.Info().Name, service.Info().Version, natsError.Error())
 		},
 	})
 	if err != nil {
+		nc.Close()
 		return nil, func() {}, errors2.WithStack(err)
 	}
 
@@ -56,6 +59,8 @@ func NewNatsService(config ServiceConfig) (*NatsService, func(), error) {
 	}
 	cleanup := func() {
 		logger.Info("rpc service shutdown start.")
+		// Stop unregisters the micro service; Drain waits for in-flight
+		// requests and then closes the connection.
 		if err := srv.Stop(); err != nil {
 			logger.StackedError(err)
 		}
@@ -71,27 +76,26 @@ func NatsRpcAccessLog(fn func(context.Context, micro.Request)) func(context.Cont
 	return func(ctx context.Context, rawReq micro.Request) {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.GetRecoveryLog().Error("[Recovery from rpc panic]",
-					zap.Time("time", time.Now()),
-					zap.Any("error", r),
-					zap.String("path", rawReq.Subject()),
-					zap.ByteString("data", rawReq.Data()),
-					zap.String("header", headersToString(rawReq.Headers())),
-					zap.String("stack", string(debug.Stack())))
+				if rec := logger.GetRecoveryLog(); rec != nil {
+					fields := []zap.Field{
+						zap.Time("time", time.Now()),
+						zap.Any("error", r),
+						zap.String("stack", string(debug.Stack())),
+					}
+					fields = append(fields, truncatedPayloadFields(rawReq)...)
+					rec.Error("[Recovery from rpc panic]", fields...)
+				}
+				_ = rawReq.Error("500", "internal error", nil)
 			}
 		}()
 
 		start := time.Now()
-
 		fn(ctx, rawReq)
-
-		logFields := []zapcore.Field{
-			zap.String("path", rawReq.Subject()),
-			zap.ByteString("data", rawReq.Data()),
-			zap.String("header", headersToString(rawReq.Headers())),
-			zap.Int64("latency_ms", time.Since(start).Milliseconds()),
+		if access := logger.GetAccessLog(); access != nil {
+			fields := truncatedPayloadFields(rawReq)
+			fields = append(fields, zap.Int64("latency_ms", time.Since(start).Milliseconds()))
+			access.Info("nats-rpc", fields...)
 		}
-		logger.GetAccessLog().Info("nats-rpc", logFields...)
 	}
 }
 
@@ -101,6 +105,36 @@ func (s *NatsService) GetSrv() micro.Service {
 
 func (s *NatsService) GetClient() *nats.Conn {
 	return s.nc
+}
+
+func truncateBytes(b []byte) (logged []byte, truncated bool, size int) {
+	size = len(b)
+	if size <= maxLogBytes {
+		return b, false, size
+	}
+	return bytes.Clone(b[:maxLogBytes]), true, size
+}
+
+func truncateString(s string) (logged string, truncated bool, size int) {
+	size = len(s)
+	if size <= maxLogBytes {
+		return s, false, size
+	}
+	return strings.Clone(s[:maxLogBytes]), true, size
+}
+
+func truncatedPayloadFields(rawReq micro.Request) []zap.Field {
+	loggedData, dataTrunc, dataSize := truncateBytes(rawReq.Data())
+	loggedHeader, headerTrunc, headerSize := truncateString(headersToString(rawReq.Headers()))
+	return []zap.Field{
+		zap.String("path", rawReq.Subject()),
+		zap.ByteString("data", loggedData),
+		zap.Bool("data_truncated", dataTrunc),
+		zap.Int("data_size", dataSize),
+		zap.String("header", loggedHeader),
+		zap.Bool("header_truncated", headerTrunc),
+		zap.Int("header_size", headerSize),
+	}
 }
 
 func headersToString(m micro.Headers) string {

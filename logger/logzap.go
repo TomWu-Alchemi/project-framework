@@ -2,10 +2,13 @@ package logger
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"regexp"
 	"runtime/debug"
@@ -42,6 +45,8 @@ type Config struct {
 	// Optional.
 	Skipper Skipper
 }
+
+const maxLogBytes = 256 << 10
 
 var (
 	sensitiveHeaders = map[string]struct{}{
@@ -83,14 +88,14 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			body, _ := io.ReadAll(c.Request.Body)
 			bodyStr = string(body)
 			c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
-			contentType := c.GetHeader("Content-Type")
-			if c.Request.Method == http.MethodPost && contentType == "application/x-www-form-urlencoded" {
-				// 打印请求时过滤敏感信息
-				bodyStr = filterSensitiveData(bodyStr)
-			}
-			if c.Request.Method == http.MethodPost && contentType == "application/json" {
-				// 打印请求时过滤敏感信息
-				bodyStr = filterSensitiveDataForJson(bodyStr)
+			mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+			if err == nil {
+				switch mediaType {
+				case "application/x-www-form-urlencoded":
+					bodyStr = filterSensitiveData(bodyStr)
+				case "application/json":
+					bodyStr = filterSensitiveDataForJson(bodyStr)
+				}
 			}
 		}
 		c.Next()
@@ -118,11 +123,14 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				end = end.UTC()
 			}
 
+			loggedQuery, queryTruncated, querySize := truncateString(filterSensitiveQuery(query))
 			fields := []zapcore.Field{
 				zap.Int("status", c.Writer.Status()),
 				zap.String("method", c.Request.Method),
 				zap.String("path", path),
-				zap.String("query", query),
+				zap.String("query", loggedQuery),
+				zap.Bool("query_truncated", queryTruncated),
+				zap.Int("query_size", querySize),
 				zap.String("ip", c.ClientIP()),
 				zap.String("user-agent", c.Request.UserAgent()),
 				zap.Int64("latency", latency.Milliseconds()),
@@ -132,7 +140,12 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				fields = append(fields, zap.String("time", end.Format(conf.TimeFormat)))
 			}
 			if len(bodyStr) > 0 {
-				fields = append(fields, zap.String("body", bodyStr))
+				loggedBody, bodyTruncated, bodySize := truncateString(bodyStr)
+				fields = append(fields,
+					zap.String("body", loggedBody),
+					zap.Bool("body_truncated", bodyTruncated),
+					zap.Int("body_size", bodySize),
+				)
 			}
 
 			if conf.Context != nil {
@@ -158,34 +171,92 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 }
 
 func filterSensitiveData(body string) string {
-	// 将 body 按照 & 分割成 key=value 形式的片段
-	parts := strings.Split(body, "&")
-
-	// 遍历每个片段，检查是否是 password 字段
-	for i, part := range parts {
-		if strings.HasPrefix(part, "password=") {
-			// 将 password 的值替换为 ***
-			parts[i] = "password=******"
+	var b strings.Builder
+	first := true
+	for part := range strings.SplitSeq(body, "&") {
+		if !first {
+			b.WriteByte('&')
 		}
+		first = false
+		key, _, found := strings.Cut(part, "=")
+		if !found {
+			b.WriteString(part)
+			continue
+		}
+		decoded, err := url.QueryUnescape(key)
+		if err != nil {
+			decoded = key
+		}
+		if strings.EqualFold(decoded, "password") {
+			b.WriteString(key)
+			b.WriteString("=******")
+			continue
+		}
+		b.WriteString(part)
 	}
-
-	// 将所有片段重新组合成字符串并返回
-	return strings.Join(parts, "&")
+	return b.String()
 }
 
 func filterSensitiveDataForJson(body string) string {
-	var jsonData map[string]interface{}
-	if err := sonic.UnmarshalString(body, &jsonData); err == nil {
-		// 将密码字段替换为 ***
-		if _, exists := jsonData["password"]; exists {
-			jsonData["password"] = "******"
-		}
-		// 重新序列化 JSON
-		filteredBytes, _ := sonic.Marshal(jsonData)
-		return string(filteredBytes)
+	var v any
+	if err := sonic.UnmarshalString(body, &v); err != nil {
+		return body
 	}
-	// 如果解析失败，返回原始内容
-	return body
+	maskPasswordInJSON(v)
+	filtered, err := sonic.Marshal(v)
+	if err != nil {
+		return body
+	}
+	return string(filtered)
+}
+
+func maskPasswordInJSON(v any) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, child := range x {
+			if strings.EqualFold(k, "password") {
+				x[k] = "******"
+				continue
+			}
+			maskPasswordInJSON(child)
+		}
+	case []any:
+		for _, child := range x {
+			maskPasswordInJSON(child)
+		}
+	}
+}
+
+func filterSensitiveQuery(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return raw
+	}
+	changed := false
+	for k, vs := range values {
+		if !strings.EqualFold(k, "password") {
+			continue
+		}
+		for i := range vs {
+			vs[i] = "******"
+		}
+		changed = true
+	}
+	if !changed {
+		return raw
+	}
+	return values.Encode()
+}
+
+func truncateString(s string) (logged string, truncated bool, size int) {
+	size = len(s)
+	if size <= maxLogBytes {
+		return s, false, size
+	}
+	return strings.Clone(s[:maxLogBytes]), true, size
 }
 
 func defaultHandleRecovery(c *gin.Context, err interface{}) {
@@ -228,8 +299,11 @@ func CustomRecoveryWithZap(logger ZapLogger, stack bool, recovery gin.RecoveryFu
 						zap.Any("error", err),
 						zap.String("request", string(httpRequest)),
 					)
-					// If the connection is dead, we can't write a status to it.
-					c.Error(err.(error)) //nolint: errcheck
+					if e, ok := err.(error); ok {
+						_ = c.Error(e)
+					} else {
+						_ = c.Error(fmt.Errorf("%v", err))
+					}
 					c.Abort()
 					return
 				}

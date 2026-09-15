@@ -3,11 +3,13 @@ package cacheproxy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"time"
+
 	"github.com/TomWu-Alchemi/project-framework/logger"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
-	"sync"
-	"time"
 )
 
 type SingleGetter interface {
@@ -57,7 +59,9 @@ type CacheContext struct {
 }
 
 func Init(rdb *redis.Client) {
-	defaultProxy = newCacheProxy(rdb)
+	once.Do(func() {
+		defaultProxy = newCacheProxy(rdb)
+	})
 }
 
 func GetInstance() *CacheProxy {
@@ -104,9 +108,14 @@ func (p *CacheProxy) GetHit(ctx context.Context, c CacheContext, key string, get
 		}
 		// 异步写入
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("cacheProxy setData panic: %v", r)
+				}
+			}()
 			setErr := p.setData(context.Background(), c, key, data, needFastRequery)
 			if setErr != nil {
-				logger.Error("cacheProxy setErr:" + setErr.Error())
+				logger.Errorf("cacheProxy setErr: %v", setErr)
 			}
 		}()
 		return data, false, nil
@@ -118,14 +127,20 @@ func (p *CacheProxy) GetHit(ctx context.Context, c CacheContext, key string, get
 		}
 		// 过期刷新
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Errorf("cacheProxy refresh panic: %v", r)
+				}
+			}()
 			newCtx := context.Background()
 			data, needFastRequery, err2 := p.getResource(newCtx, key, getter)
 			if err2 != nil {
-				logger.Error("cacheProxy refresh getResource err:" + err2.Error())
+				logger.Errorf("cacheProxy refresh getResource err: %v", err2)
+				return
 			}
 			err2 = p.setData(newCtx, c, key, data, needFastRequery)
 			if err2 != nil {
-				logger.Error("cacheProxy refresh setData err:" + err2.Error())
+				logger.Errorf("cacheProxy refresh setData err: %v", err2)
 			}
 		}()
 	}
@@ -149,7 +164,6 @@ func (p *CacheProxy) Remove(ctx context.Context, c CacheContext, key string) err
 
 func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleGetter) (string, bool, error) {
 	val, err, _ := p.getGroup.Do(key, func() (interface{}, error) {
-		var getErr error
 		data, needFastRequery, getErr := getter.Get(ctx, key)
 		if getErr != nil {
 			return nil, getErr
@@ -159,14 +173,15 @@ func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleG
 		}
 		return data, nil
 	})
-	res := val.(string)
-	if err != nil {
-		if errors.Is(err, fastRequeryErr) {
-			// 需要快速回源
-			return res, true, nil
-		} else {
-			return "", false, err
-		}
+	if err != nil && !errors.Is(err, fastRequeryErr) {
+		return "", false, err
+	}
+	res, ok := val.(string)
+	if !ok {
+		return "", false, fmt.Errorf("cacheproxy: unexpected singleflight type %T", val)
+	}
+	if errors.Is(err, fastRequeryErr) {
+		return res, true, nil
 	}
 	return res, false, nil
 }

@@ -93,8 +93,9 @@ func PrometheusGinMiddleware() gin.HandlerFunc {
 		// 将方法和路径通过下划线连接
 		endpoint := method + "_" + path
 
-		// 记录请求大小
-		httpRequestSize.WithLabelValues(endpoint).Observe(float64(contentLength))
+		if contentLength >= 0 {
+			httpRequestSize.WithLabelValues(endpoint).Observe(float64(contentLength))
+		}
 
 		// 增加当前处理的请求数
 		httpRequestsInFlight.WithLabelValues(endpoint).Inc()
@@ -124,24 +125,21 @@ func PrometheusGinMiddleware() gin.HandlerFunc {
 		// 记录业务响应情况
 		responseCode, exist := c.Get(ResponseCodeMetricKey)
 		if exist {
-			code := responseCode.(int)
-			responseCounterTotal.WithLabelValues(endpoint, strconv.Itoa(code)).Inc()
+			if code, ok := responseCode.(int); ok {
+				responseCounterTotal.WithLabelValues(endpoint, strconv.Itoa(code)).Inc()
+			}
 		}
 	}
 }
 
 func MetricWhitelist(ipList []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if len(ipList) == 0 {
-			c.Next()
-		} else {
-			if !slices.Contains(ipList, c.ClientIP()) {
-				c.JSON(http.StatusNotFound, nil)
-				c.Abort()
-				return
-			}
-			c.Next()
+		if len(ipList) == 0 || !slices.Contains(ipList, c.ClientIP()) {
+			c.JSON(http.StatusNotFound, nil)
+			c.Abort()
+			return
 		}
+		c.Next()
 	}
 }
 
