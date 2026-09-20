@@ -142,21 +142,27 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			// 否则会凭空多出 "body":"[filtered len=0]" 字段，污染全量访问日志。
 			if bodyStr != "" {
 				mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+				// bodyFiltered 标记上方分支是否已输出占位符；未占位时下方统一做
+				// “未掩码 password 兜底断言”，堵住任何保原文路径把明文密码写进日志。
+				bodyFiltered := false
 				// F-20（fail closed）：非明文编码（gzip 等）、Content-Type 缺失/非法、
 				// 截断的 form/json 都无法可靠脱敏，一律占位、禁止回显原文，与
 				// filterSensitiveQuery 对不可解析 query 的 P3-10 取舍一致。
 				if enc := c.GetHeader("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 					bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+					bodyFiltered = true
 				} else if err != nil {
 					// Content-Type 缺失或非法：没有媒体类型可用于选择脱敏策略，原文
 					// 可能含 password 明文，一律占位（修复前这条路径会原样回显原文）。
 					bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+					bodyFiltered = true
 				} else {
 					switch mediaType {
 					case "application/x-www-form-urlencoded":
 						if bodyTruncatedAtRead {
 							// 截断点可能落在 password 值中间，值前缀仍会泄漏
 							bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+							bodyFiltered = true
 						} else {
 							bodyStr = filterSensitiveData(bodyStr)
 						}
@@ -165,15 +171,21 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 							// 截断的 JSON 解析必然失败（scan 到截断点才报错），
 							// 与 form 分支一致直接占位，省掉一次必然失败的解析（P-1.6）。
 							bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+							bodyFiltered = true
 						} else {
 							bodyStr = filterSensitiveDataForJson(bodyStr)
 						}
 					default:
-						// 有意保留原文：未识别的媒体类型（multipart/form-data、text/*，以及
-						// `json` 这类 ParseMediaType 成功但非合法 MIME 形态的值）不做占位，
-						// 保住非结构化 body 的排障信息。已知取舍：multipart 正常表单提交的
-						// password 字段仍会明文入库，作为后续独立事项评估；本处不要改为占位。
+						// 未识别的媒体类型（multipart/form-data、text/*，以及 `json` 这类
+						// ParseMediaType 成功但非合法 MIME 形态的值）保持原文以保住排障信息。
+						// 明文安全由下方统一兜底断言保证：检测到未掩码 password 值即占位。
 					}
+				}
+				// 统一兜底断言层（fail closed）：凡未走占位符的路径（尤其是保原文的未识别
+				// 媒体类型、声明类型与实际 body 不符的路径）在写入日志前，必须再过一遍
+				// “是否仍含未掩码 password 值”；命中即占位。策略单一，不做二次脱敏。
+				if !bodyFiltered && hasUnmaskedPassword(bodyStr) {
+					bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
 				}
 			}
 		}
@@ -210,19 +222,19 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				fields = append(fields, zap.Error(bodyReadErr))
 			}
 			if len(bodyStr) > 0 || bodyTruncatedAtRead {
-				loggedBody, bodyTruncated, bodySize := logutil.TruncateString(bodyStr)
+				loggedBody, bodyTruncated, _ := logutil.TruncateString(bodyStr)
 				if bodyTruncatedAtRead {
 					bodyTruncated = true
-					// 截断时 bodyStr 可能是占位符（20 余字节），TruncateString 给出的
-					// bodySize 会取到占位符自身长度，与 body_truncated=true 自相矛盾；
-					// 统一改用日志口径的原始长度（已在上方按 ContentLength 修正，
-					// 长度未知时退化为已读到的下界）。
-					bodySize = bodyOriginalLen
 				}
+				// body_size 恒为“日志口径的原始 body 长度”，与 body 字段实际写出的文本
+				// 长度解耦：占位符仅 20 余字节、脱敏后的 JSON/form 也可能比原文更长，若
+				// 沿用 TruncateString 的 size（脱敏后/占位符长度）会与原文长度自相矛盾。
+				// bodyOriginalLen 已在上方算好：截断时按 Content-Length 还原，未知时退化
+				// 为已读下界。body_truncated 的语义与取值维持现状不变。
 				fields = append(fields,
 					zap.String("body", loggedBody),
 					zap.Bool("body_truncated", bodyTruncated),
-					zap.Int("body_size", bodySize),
+					zap.Int("body_size", bodyOriginalLen),
 				)
 			}
 
@@ -279,6 +291,10 @@ func snapshotRequestBody(r *http.Request) ([]byte, bool, error) {
 	return logged, truncated, nil
 }
 
+// maskedPasswordValue 是 password 掩码后写入日志的字面量：JSON / form / query 三条
+// 脱敏路径统一产出它，hasUnmaskedPassword 也据此判定“已掩码”。
+const maskedPasswordValue = "******"
+
 func filterSensitiveData(body string) string {
 	var b strings.Builder
 	first := true
@@ -298,12 +314,243 @@ func filterSensitiveData(body string) string {
 		}
 		if strings.EqualFold(decoded, "password") {
 			b.WriteString(key)
-			b.WriteString("=******")
+			b.WriteString("=" + maskedPasswordValue)
 			continue
 		}
 		b.WriteString(part)
 	}
 	return b.String()
+}
+
+// hasUnmaskedPassword 判定“最终要写入日志的 body 文本”中是否仍残留未掩码的 password 值，
+// 作为未识别媒体类型（multipart/text/* 等）保留原文路径的兜底断言层：命中即改为占位符。
+//
+// 判据（大小写不敏感；“password” 前必须是标识符边界，避免 mypassword / new_password 误判）：
+//   - 带引号 key：`"password" : "值"` / `'password': '值'`（JSON、Python 风格）——值非空
+//     且不是 ****** 即泄漏；含转义与嵌套；仅出现键而无值、或 null 视为无值；
+//   - 无引号 key：`password:"值"` / `password: 值`（对象字面量 / YAML / 头风格）——同上规则；
+//   - form/query：`password=值`——值非空且不是 ****** 即泄漏（值以 '&' 收尾）；
+//   - multipart 字段名：`name = "password"` / `name='password'` / `name=password`
+//     （允许 '=' 两侧空白、单/双引号）——该路径不脱敏，字段值必然未掩码，直接判为泄漏。
+//
+// 不构成泄漏：文本中只有 password 一词、其后无 ':' 或 '='（如 “reset your password
+// now”），无值可判定；取值恰为 ****** 或空串同样不占位；`name="password"` 之后不是
+// 参数边界（如 HTML `<input name="password">`）或 name 前非词边界（filename=…）时
+// 不按 multipart 处理，避免误占位。
+//
+// 输入为待写日志的 body 文本（上限 logutil.MaxLogBytes ≤256KiB）。实现选择手写单遍
+// 大小写不敏感扫描而非 strings.ToLower 后 Index：后者会为每个访问请求多复制一份最多
+// 256KiB 的临时字符串，前者零额外分配。
+func hasUnmaskedPassword(s string) bool {
+	const key = "password"
+	for from := 0; from+len(key) <= len(s); {
+		i := indexFold(s, from, key)
+		if i < 0 {
+			return false
+		}
+		end := i + len(key)
+		if i > 0 && isTokenByte(s[i-1]) {
+			// 词内子串（mypassword / new_password），并非独立字段名。
+			from = end
+			continue
+		}
+		if end < len(s) {
+			// multipart 字段名（不脱敏，值必然未掩码）：优先于取值判定。
+			if hasMultipartPasswordField(s, i, end) {
+				return true
+			}
+			if val, ok := passwordValueAfter(s, end); ok && !isMaskedPasswordValue(val) {
+				return true
+			}
+		}
+		from = end
+	}
+	return false
+}
+
+// indexFold 返回 s[from:] 中首个大小写不敏感等于 key 的子串起始绝对下标，未命中返回 -1。
+// 等价于 strings.Index(strings.ToLower(s[from:]), key) 但零分配。
+func indexFold(s string, from int, key string) int {
+	m := len(key)
+	for i := from; i+m <= len(s); i++ {
+		if equalFoldAt(s, i, key) {
+			return i
+		}
+	}
+	return -1
+}
+
+func equalFoldAt(s string, i int, key string) bool {
+	for j := 0; j < len(key); j++ {
+		if lowerASCII(s[i+j]) != lowerASCII(key[j]) {
+			return false
+		}
+	}
+	return true
+}
+
+// lowerASCII 仅折叠 ASCII 大写字母；password 为纯 ASCII，足够。
+func lowerASCII(b byte) byte {
+	if 'A' <= b && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+// isTokenByte 报告 b 是否属于 [A-Za-z0-9_]（字段名可取字符），用于 password 单词边界判定。
+func isTokenByte(b byte) bool {
+	return b == '_' || '0' <= b && b <= '9' || 'a' <= b && b <= 'z' || 'A' <= b && b <= 'Z'
+}
+
+// isMaskedPasswordValue 报告 password 的取值是否无需占位：空串（无值）或掩码字面量。
+func isMaskedPasswordValue(val string) bool {
+	return val == "" || val == maskedPasswordValue
+}
+
+// hasMultipartPasswordField 判定 s[i:end]（i 为 "password" 起始、end 为其末尾）是否构成
+// multipart Content-Disposition 里的 password 字段名声明（该路径不脱敏，字段值必然未掩码）：
+//
+//	name = "password"   /   name='password'   /   name=password
+//
+// 主判据（不依赖 `name=` 前缀文本匹配）：password 命中处后一字节为字段名闭合引号
+// `"` 或 `'`，且其后（可跳过空白）为参数边界 CR / LF / ';' / 串尾 → 命中。因此
+// `{"password":"x"}`（引号后是 ':'）与 `{"password"}`（引号后是 '}'）都不命中。
+// 无引号 token 形态 `name=password` 另按 `name` '=' 前缀（word 边界）判定，避免误伤
+// 普通文本里的 “name=password” 字样之外的场景。
+func hasMultipartPasswordField(s string, i, end int) bool {
+	if end < len(s) && (s[end] == '"' || s[end] == '\'') {
+		// 带引号字段名：闭引号之后（跳过空白）须为参数边界。
+		j := end + 1
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+			j++
+		}
+		return j >= len(s) || s[j] == ';' || s[j] == '\r' || s[j] == '\n'
+	}
+	// 无引号 token 形态：`name = password` —— 其后须为参数边界，且前方须为 name= 前缀。
+	j := end
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+		j++
+	}
+	if j < len(s) && s[j] != ';' && s[j] != '\r' && s[j] != '\n' {
+		return false
+	}
+	return hasMultipartNameEquals(s, i)
+}
+
+// hasMultipartNameEquals 报告 s[:i] 是否以 `name <ws>* = <ws>*` 结尾（大小写不敏感，
+// name 前须为词边界，排除 filename=…）。用于无引号 token 形态 `name=password` 的认定。
+func hasMultipartNameEquals(s string, i int) bool {
+	k := skipSpaceBack(s, i)
+	if k == 0 || s[k-1] != '=' {
+		return false
+	}
+	k--
+	k = skipSpaceBack(s, k)
+	if k < 4 || !strings.EqualFold(s[k-4:k], "name") {
+		return false
+	}
+	return k-4 == 0 || !isTokenByte(s[k-5])
+}
+
+// passwordValueAfter 从 pos（紧随 "password" 之后）尝试取出可判定的 password 取值。
+// 返回的 val 为原样文本（可能含 JSON 转义或 form 编码）；ok 表示确实定位到一个值。
+func passwordValueAfter(s string, pos int) (val string, ok bool) {
+	i := pos
+	switch {
+	case i < len(s) && s[i] == '=':
+		// form/query: password=VALUE，值以 '&' 收尾（不存在则到串尾）。
+		start := i + 1
+		i = start
+		for i < len(s) && s[i] != '&' {
+			i++
+		}
+		return s[start:i], true
+	case i < len(s) && (s[i] == '"' || s[i] == '\''):
+		// 带引号 key："password" / 'password' [ws] ':' VALUE
+		i++
+		i = skipSpaceForward(s, i)
+		if i >= len(s) || s[i] != ':' {
+			return "", false
+		}
+		return valueAfterColon(s, i+1)
+	}
+	// 无引号 key：password [ws] ':' VALUE（对象字面量 / YAML / 头风格）。
+	i = skipSpaceForward(s, i)
+	if i < len(s) && s[i] == ':' {
+		return valueAfterColon(s, i+1)
+	}
+	return "", false
+}
+
+// valueAfterColon 取 ':' 之后的 password 取值：跳过空白；串尾视为无值；引号值取引号内
+// 内容（保留转义，未闭合按“已取值”交由上层 fail closed）；null 视为无值；其余按无引号
+// 值处理（到空白/结构分隔符为止），取空则视为无值。
+func valueAfterColon(s string, i int) (string, bool) {
+	i = skipSpaceForward(s, i)
+	if i >= len(s) {
+		return "", false
+	}
+	if s[i] == '"' || s[i] == '\'' {
+		return quotedValue(s, i+1, s[i])
+	}
+	if strings.HasPrefix(s[i:], "null") {
+		return "", false // null：无值
+	}
+	return unquotedValue(s, i), true
+}
+
+// quotedValue 从 start（开引号之后）扫描到闭合引号，返回不含引号的原始内容（保留转义）。
+// 未闭合（截断/坏 JSON）时返回剩余内容并同样视为“取到值”——截断前缀可能仍是明文密码，
+// 交由上层 fail closed 占位。
+func quotedValue(s string, start int, quote byte) (string, bool) {
+	for i := start; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++ // 跳过被转义字符，避免把 \" 误判为闭合引号
+		case quote:
+			return s[start:i], true
+		}
+	}
+	return s[start:], true
+}
+
+// unquotedValue 取无引号取值：到空白或结构分隔符为止（取空则上层视为无值）。
+func unquotedValue(s string, i int) string {
+	start := i
+	for i < len(s) && !isValueTerminator(s[i]) {
+		i++
+	}
+	return s[start:i]
+}
+
+// isValueTerminator 报告 b 是否终止无引号取值：空白 / `,` `}` `&` `;`（串尾由循环条件处理）。
+func isValueTerminator(b byte) bool {
+	switch b {
+	case ' ', '\t', '\r', '\n', ',', '}', '&', ';':
+		return true
+	}
+	return false
+}
+
+// skipSpaceForward 跳过 ASCII 空白（JSON 结构空白：空格 / Tab / CR / LF）。
+func skipSpaceForward(s string, i int) int {
+	for i < len(s) && isJSONSpace(s[i]) {
+		i++
+	}
+	return i
+}
+
+// skipSpaceBack 从 i 向前跳过空格 / Tab，返回新的下标（用于 multipart 参数内的空白）。
+func skipSpaceBack(s string, i int) int {
+	for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t') {
+		i--
+	}
+	return i
+}
+
+// isJSONSpace 报告 b 是否为 JSON 结构空白（RFC 8259）。
+func isJSONSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // jsonLogAPI 是包级冻结一次的 sonic 解码 API：UseNumber 让大于 2^53 的整数
@@ -342,7 +589,7 @@ func maskPasswordInJSON(v any) {
 	case map[string]any:
 		for k, child := range x {
 			if strings.EqualFold(k, "password") {
-				x[k] = "******"
+				x[k] = maskedPasswordValue
 				continue
 			}
 			maskPasswordInJSON(child)
@@ -369,7 +616,7 @@ func filterSensitiveQuery(raw string) string {
 			continue
 		}
 		for i := range vs {
-			vs[i] = "******"
+			vs[i] = maskedPasswordValue
 		}
 		changed = true
 	}
