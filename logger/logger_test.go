@@ -27,6 +27,20 @@ func attachBufferLogger(t *testing.T) *bytes.Buffer {
 	return buf
 }
 
+// initLoggerWithDir 是测试专用 helper：在 dir 下按 InitLogger 默认值构建全部 logger。
+// 目录作为参数（而非硬编码 ./log）便于测试重定向到 t.TempDir()。
+//
+// 注意：它直接调用 initLoggerWithConfig，绕过包级 initOnce——因此仅限测试使用；
+// 生产代码必须走 InitLogger / InitLoggerWithConfig（见 logger_bench_test.go 说明）。
+func initLoggerWithDir(dir string) {
+	initLoggerWithConfig(LoggerConfig{
+		Dir:        dir,
+		JSON:       false,
+		AlsoStdout: true,
+		Compress:   false,
+	})
+}
+
 func TestInfo_DoesNotLogArgsAsSingleSlice(t *testing.T) {
 	buf := attachBufferLogger(t)
 	Info("hello", 1)

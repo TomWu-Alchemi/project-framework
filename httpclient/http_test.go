@@ -344,3 +344,91 @@ func TestGetWithRetry_NilClient(t *testing.T) {
 		t.Fatalf("nil httpClient err=%v", err)
 	}
 }
+
+// 审查项 #5：ctxErrWithLast 的三条语义（nil ctx、nil/同源 lastErr、异源包装）单元锁定。
+func TestCtxErrWithLast(t *testing.T) {
+	ctxErr := context.DeadlineExceeded
+	lastErr := errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
+
+	t.Run("nil ctx error returns last error", func(t *testing.T) {
+		if got := ctxErrWithLast(nil, lastErr); got != lastErr {
+			t.Fatalf("got %v, want the last error unchanged", got)
+		}
+	})
+	t.Run("nil last error returns ctx error", func(t *testing.T) {
+		if got := ctxErrWithLast(ctxErr, nil); got != ctxErr {
+			t.Fatalf("got %v, want the ctx error unchanged", got)
+		}
+	})
+	t.Run("same-source last error is deduplicated", func(t *testing.T) {
+		got := ctxErrWithLast(ctxErr, fmt.Errorf("request failed: %w", ctxErr))
+		if got != ctxErr {
+			t.Fatalf("got %v, want the bare ctx error", got)
+		}
+		if strings.Contains(got.Error(), "(last err:") {
+			t.Fatalf("same-source error must not be appended a second time: %v", got)
+		}
+	})
+	t.Run("distinct last error is appended preserving both chains", func(t *testing.T) {
+		got := ctxErrWithLast(ctxErr, lastErr)
+		if !errors.Is(got, ctxErr) {
+			t.Fatalf("ctx chain lost: %v", got)
+		}
+		if !errors.Is(got, lastErr) {
+			t.Fatalf("last-error chain lost: %v", got)
+		}
+		if !strings.Contains(got.Error(), "(last err:") || !strings.Contains(got.Error(), lastErr.Error()) {
+			t.Fatalf("error text must carry the last error: %v", got)
+		}
+	})
+}
+
+// 场景 A：Do 返回网络错误且 ctx 已取消 → 返回错误同时保留 ctx 链与底层错误链。
+func TestGetWithRetry_ContextCanceledKeepsLastErr(t *testing.T) {
+	baseErr := errors.New("simulated transport failure")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	c := NewDalHttpClient(DalHttpClientConf{Timeout: 5 * time.Second})
+	c.httpClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, baseErr
+	})
+
+	_, err := c.GetWithRetry(ctx, "http://example.invalid/", nil, nil, 3)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ctx chain lost: %v", err)
+	}
+	if !errors.Is(err, baseErr) {
+		t.Fatalf("underlying error chain lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), baseErr.Error()) {
+		t.Fatalf("error text must carry the underlying error: %v", err)
+	}
+}
+
+// 场景 B：lastErr 与 ctxErr 同源（Do 返回包装 ctx 超时的错误）→ 去重，
+// 错误文本不得出现 "(last err:" 后缀。
+func TestGetWithRetry_ContextErrDeduplicatesSameSource(t *testing.T) {
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	c := NewDalHttpClient(DalHttpClientConf{Timeout: 5 * time.Second})
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		// 真实 *http.Transport 在 ctx 超时时正是返回包装 DeadlineExceeded 的 *url.Error。
+		return nil, &url.Error{Op: "Get", URL: req.URL.String(), Err: context.DeadlineExceeded}
+	})
+
+	_, err := c.GetWithRetry(ctx, "http://example.invalid/", nil, nil, 3)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ctx chain lost: %v", err)
+	}
+	if strings.Contains(err.Error(), "(last err:") {
+		t.Fatalf("same-source ctx error must be deduplicated: %v", err)
+	}
+}

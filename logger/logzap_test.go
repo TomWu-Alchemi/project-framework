@@ -257,6 +257,53 @@ func TestGinzapWithConfig_WarnLevelUsesErrorFallback(t *testing.T) {
 	}
 }
 
+// fieldCapturingLogger implements only ZapLogger (Info/Error) and records each
+// entry's message together with its decoded fields, so tests can assert the
+// fallback branch's msg and that path is still carried in the fields.
+type fieldCapturingLogger struct {
+	msgs   []string
+	fields []map[string]any
+}
+
+func (l *fieldCapturingLogger) Info(msg string, fs ...zap.Field)  { l.record(msg, fs) }
+func (l *fieldCapturingLogger) Error(msg string, fs ...zap.Field) { l.record(msg, fs) }
+
+func (l *fieldCapturingLogger) record(msg string, fs []zap.Field) {
+	enc := zapcore.NewMapObjectEncoder()
+	for _, f := range fs {
+		f.AddTo(enc)
+	}
+	l.msgs = append(l.msgs, msg)
+	l.fields = append(l.fields, enc.Fields)
+}
+
+// 审查项 #6：fallback 分支（仅实现 Info/Error 的自定义 logger）msg 必须与
+// levelLogger 分支一致为 "http"，且 path 仍完整保留在 fields 中。
+func TestGinzapWithConfig_FallbackMsgIsHTTPWithPathField(t *testing.T) {
+	tests := []struct {
+		name  string
+		level zapcore.Level
+	}{
+		{"info fallback", zapcore.InfoLevel},
+		{"error fallback", zapcore.WarnLevel},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &fieldCapturingLogger{}
+			serveGinzapRequest(t, l, tc.level)
+			if len(l.msgs) != 1 {
+				t.Fatalf("want exactly one fallback entry, got msgs=%v", l.msgs)
+			}
+			if l.msgs[0] != "http" {
+				t.Fatalf("fallback msg = %q, want %q", l.msgs[0], "http")
+			}
+			if got := l.fields[0]["path"]; got != "/x" {
+				t.Fatalf("path field = %v, want /x", got)
+			}
+		})
+	}
+}
+
 func TestGinzapWithConfig_ZapLoggerKeepsExactLevel(t *testing.T) {
 	zl, buf := ginZapBuffer(t) // buffer core with DebugLevel enabled
 	serveGinzapRequest(t, zl, zapcore.WarnLevel)

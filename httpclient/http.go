@@ -106,6 +106,23 @@ func waitRetry(ctx context.Context, attempt int) error {
 	}
 }
 
+// ctxErrWithLast 在 ctx 已结束的返回点上附带最后一次业务错误，避免调用方
+// 只看到 context deadline exceeded / canceled 而丢失真实失败原因。
+// 双 %w 保留两条错误链：errors.Is/As 对 ctx 错误与 lastErr 均可命中。
+func ctxErrWithLast(ctxErr, lastErr error) error {
+	if ctxErr == nil {
+		// 防御分支：调用点的 ctxErr 均取自 ctx.Err()/waitRetry，实际不会为 nil。
+		return lastErr
+	}
+	if lastErr == nil || errors.Is(lastErr, ctxErr) {
+		// 去重：请求因 ctx 结束而失败时 lastErr 常与 ctxErr 同源（如 *url.Error
+		// 包装 context.DeadlineExceeded），此时只返回 ctxErr，避免输出重复的
+		// "context deadline exceeded (last err: context deadline exceeded)"。
+		return ctxErr
+	}
+	return fmt.Errorf("%w (last err: %w)", ctxErr, lastErr)
+}
+
 func readLimitedBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 	resp.Body = http.MaxBytesReader(nil, resp.Body, maxResponseBytes)
@@ -261,7 +278,7 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 		if err != nil {
 			lastErr = err
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, ctxErrWithLast(ctx.Err(), lastErr)
 			}
 			if i == attempts-1 {
 				break
@@ -275,7 +292,7 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 				zap.Error(err),
 			)
 			if waitErr := waitRetry(ctx, i); waitErr != nil {
-				return nil, waitErr
+				return nil, ctxErrWithLast(waitErr, lastErr)
 			}
 			continue
 		}
@@ -299,7 +316,7 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 				zap.Error(err),
 			)
 			if waitErr := waitRetry(ctx, i); waitErr != nil {
-				return nil, waitErr
+				return nil, ctxErrWithLast(waitErr, lastErr)
 			}
 			continue
 		}
@@ -332,7 +349,7 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 			break
 		}
 		if waitErr := waitRetry(ctx, i); waitErr != nil {
-			return nil, waitErr
+			return nil, ctxErrWithLast(waitErr, lastErr)
 		}
 	}
 

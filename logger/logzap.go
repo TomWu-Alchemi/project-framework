@@ -253,11 +253,16 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				ll.Log(conf.DefaultLevel, "http", fields...)
 			} else if conf.DefaultLevel <= zapcore.InfoLevel {
 				// Fallback logger exposes only Info/Error: Debug/Info must not
-				// be dropped, so they are emitted through Info.
-				logger.Info(path, fields...)
+				// be dropped, so they are emitted through Info. msg is "http"
+				// (identical to the levelLogger branch above) so access logs are
+				// searchable by a single message name; the request path is still
+				// carried in full by the fields (zap.String("path", path)).
+				logger.Info("http", fields...)
 			} else {
 				// Warn and above are conservatively emitted through Error.
-				logger.Error(path, fields...)
+				// msg is "http" for the same reason as the branch above; the
+				// request path remains available in the fields.
+				logger.Error("http", fields...)
 			}
 		}
 	}
