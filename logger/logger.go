@@ -148,8 +148,8 @@ func InitLoggerWithConfig(cfg LoggerConfig) {
 	})
 }
 
-// Shutdown 刷新落盘、停止轮转 goroutine 并关闭 InitLogger/initLoggerWithDir
-// 创建的全部 lumberjack writer。仅用于进程退出阶段的最后一步调用；重复调用安全（幂等）。
+// Shutdown 刷新落盘、停止轮转 goroutine 并关闭 InitLogger 创建的全部
+// lumberjack writer。仅用于进程退出阶段的最后一步调用；重复调用安全（幂等）。
 //
 // 语义边界（F-29）：lumberjack 的 Close 只关闭当前句柄（file 置 nil），之后的
 // Write 会经 openExistingOrNew 重新打开文件并写入成功——该句柄不再受本函数
@@ -164,17 +164,6 @@ func Shutdown() {
 	if rt := runtimePtr.Load(); rt != nil {
 		rt.stop()
 	}
-}
-
-// initLoggerWithDir 在 dir 下按当前 InitLogger 默认值构建全部 logger。
-// 目录作为参数（而非硬编码 ./log）便于测试重定向到 t.TempDir()。
-func initLoggerWithDir(dir string) {
-	initLoggerWithConfig(LoggerConfig{
-		Dir:        dir,
-		JSON:       false,
-		AlsoStdout: true,
-		Compress:   false,
-	})
 }
 
 func combineStdout(file zapcore.WriteSyncer, alsoStdout bool) zapcore.WriteSyncer {

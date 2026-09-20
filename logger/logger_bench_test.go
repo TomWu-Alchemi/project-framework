@@ -12,7 +12,8 @@ import (
 
 // P-3（缓冲写）前后对照基准。
 //
-// 方案说明：InitLogger / InitLoggerWithConfig / initLoggerWithDir 共享包级 initOnce，
+// 方案说明：InitLogger / InitLoggerWithConfig 共享包级 initOnce（测试专用 helper
+// initLoggerWithDir 直接调用 initLoggerWithConfig、不走 initOnce，不可用于生产），
 // 同一进程内无法用它们初始化「同步写」与「缓冲写」两套 logger，因此这里下沉到
 // WriteSyncer 层直接对照：同一份 lumberjack 文件 writer，一组直接 AddSync（等价
 // BufferSize=0 的旧路径），一组套 zapcore.BufferedWriteSyncer（BufferSize=256KiB）。
