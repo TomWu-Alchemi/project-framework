@@ -6,15 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"github.com/TomWu-Alchemi/project-framework/internal/logutil"
 	"github.com/bytedance/sonic"
-	errors2 "github.com/pkg/errors"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+)
+
+const (
+	maxResponseBytes = 10 << 20
+	retryBaseDelay   = 50 * time.Millisecond
+	retryMaxDelay    = 2 * time.Second
+	defaultTimeout   = 10 * time.Second
 )
 
 type DalHttpClient struct {
@@ -24,141 +32,329 @@ type DalHttpClient struct {
 
 type DalHttpClientConf struct {
 	Timeout time.Duration
-	DalLog  *zap.Logger
+	// DalLog 为 DAL 日志器（记录本条请求的全量 path/header/data/response）。
+	// nil 表示**不记录任何 DAL 日志**：这是显式 opt-in 设计——DAL 日志是全量
+	// 请求/响应记录，未注入时既不产生日志，也不占用全局日志通道（本字段与
+	// logger.GetDalLog() 相互独立，nil 不会回退全局 DAL 日志）。
+	DalLog *zap.Logger
 }
 
-var ErrFailedRequest = errors.New("failed request")
+var (
+	ErrFailedRequest = errors.New("failed request")
+	ErrNilClient     = errors.New("httpclient: nil client")
+)
 
 func NewDalHttpClient(conf DalHttpClientConf) *DalHttpClient {
+	if conf.Timeout <= 0 {
+		conf.Timeout = defaultTimeout
+	}
+	// F-26：宿主可能替换 http.DefaultTransport（测试注入 / APM 仪器化的常见做法），
+	// 硬类型断言会让构造直接 panic。ok 断言失败时兜底自建 Transport，
+	// 其余字段对齐 http.DefaultTransport 的默认值。
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		t = t.Clone()
+	} else {
+		t = &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	t.MaxIdleConns = 100
+	t.MaxIdleConnsPerHost = 100
+	t.IdleConnTimeout = 60 * time.Second
 	return &DalHttpClient{
-		httpClient: &http.Client{Timeout: conf.Timeout, Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     60 * time.Second,
-			Proxy:               http.ProxyFromEnvironment,
-		}},
-		dalLog: conf.DalLog,
+		httpClient: &http.Client{Timeout: conf.Timeout, Transport: t},
+		dalLog:     conf.DalLog,
 	}
 }
 
-func (c *DalHttpClient) PostJson(ctx context.Context, url string, headers map[string]string, data any, resp any) error {
+func isSuccessStatus(code int) bool {
+	return code >= 200 && code < 300
+}
+
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
+func retryBackoff(attempt int) time.Duration {
+	backoff := retryMaxDelay
+	if attempt < 6 {
+		backoff = min(retryBaseDelay<<attempt, retryMaxDelay)
+	}
+	j := backoff / 10
+	if j > 0 {
+		backoff += time.Duration(rand.Int64N(int64(2*j)+1)) - j
+	}
+	if backoff < 0 {
+		backoff = 0
+	}
+	return backoff
+}
+
+func waitRetry(ctx context.Context, attempt int) error {
+	timer := time.NewTimer(retryBackoff(attempt))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// ctxErrWithLast 在 ctx 已结束的返回点上附带最后一次业务错误，避免调用方
+// 只看到 context deadline exceeded / canceled 而丢失真实失败原因。
+// 双 %w 保留两条错误链：errors.Is/As 对 ctx 错误与 lastErr 均可命中。
+func ctxErrWithLast(ctxErr, lastErr error) error {
+	if ctxErr == nil {
+		// 防御分支：调用点的 ctxErr 均取自 ctx.Err()/waitRetry，实际不会为 nil。
+		return lastErr
+	}
+	if lastErr == nil || errors.Is(lastErr, ctxErr) {
+		// 去重：请求因 ctx 结束而失败时 lastErr 常与 ctxErr 同源（如 *url.Error
+		// 包装 context.DeadlineExceeded），此时只返回 ctxErr，避免输出重复的
+		// "context deadline exceeded (last err: context deadline exceeded)"。
+		return ctxErr
+	}
+	return fmt.Errorf("%w (last err: %w)", ctxErr, lastErr)
+}
+
+func readLimitedBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	resp.Body = http.MaxBytesReader(nil, resp.Body, maxResponseBytes)
+	return io.ReadAll(resp.Body)
+}
+
+func failedRequest(status int, body []byte) error {
+	logged, _, _ := logutil.TruncateBytes(body)
+	return fmt.Errorf("%w: status=%d body=%s", ErrFailedRequest, status, logged)
+}
+
+func wrapReadBody(err error) error {
+	if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return fmt.Errorf("response body exceeds size limit (%d bytes): %w", maxErr.Limit, maxErr)
+	}
+	return fmt.Errorf("failed to read response body: %w", err)
+}
+
+// info 在 DalLog 非 nil 时打一条 Info 级 DAL 日志。
+// DalLog == nil 表示**不记录任何 DAL 日志**（显式 opt-in，见 DalHttpClientConf.DalLog），
+// 此情况下静默返回，不写日志、不占用全局日志通道。
+func (c *DalHttpClient) info(msg string, fields ...zap.Field) {
+	if c.dalLog == nil {
+		return
+	}
+	c.dalLog.Info(msg, fields...)
+}
+
+// warn 在 DalLog 非 nil 时打一条 Warn 级 DAL 日志。
+// DalLog == nil 表示**不记录任何 DAL 日志**（显式 opt-in，见 DalHttpClientConf.DalLog），
+// 此情况下静默返回，不写日志、不占用全局日志通道。
+func (c *DalHttpClient) warn(msg string, fields ...zap.Field) {
+	if c.dalLog == nil {
+		return
+	}
+	c.dalLog.Warn(msg, fields...)
+}
+
+// PostJson marshals data as JSON, POSTs it to rawURL and, unless resp is nil
+// or the response is 204/empty, unmarshals the response body into resp.
+//
+// Design note (P3-5): PostJson never retries, unlike GetWithRetry. POST is not
+// idempotent, so replaying it automatically could duplicate the server-side
+// effect. Callers that need retries must implement them on top of PostJson
+// and guarantee idempotency themselves (for example with an idempotency key).
+func (c *DalHttpClient) PostJson(ctx context.Context, rawURL string, headers map[string]string, data any, resp any) error {
+	if c == nil || c.httpClient == nil {
+		return ErrNilClient
+	}
 	jsonData, err := sonic.Marshal(data)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
-	}
-	if _, exists := headers["Content-Type"]; !exists {
-		req.Header.Set("Content-Type", "application/json")
 	}
 	headerSb := strings.Builder{}
 	headerSb.Grow(len(headers) * 20)
 	for k, v := range headers {
 		req.Header.Set(k, v)
-		headerSb.WriteString(fmt.Sprintf("(%s:%s),", k, v))
+		headerSb.WriteByte('(')
+		headerSb.WriteString(k)
+		headerSb.WriteByte(':')
+		headerSb.WriteString(v)
+		headerSb.WriteString("),")
 	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
 	start := time.Now()
 	rawResponse, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
-	defer rawResponse.Body.Close()
 
-	// 限制响应体大小为 10MB
-	rawResponse.Body = http.MaxBytesReader(nil, rawResponse.Body, 10<<20)
-
-	bodyBytes, err := io.ReadAll(rawResponse.Body)
+	bodyBytes, err := readLimitedBody(rawResponse)
 	if err != nil {
-		if errors.Is(err, &http.MaxBytesError{}) {
-			return errors2.New("response body exceeds size limit")
-		}
-		return errors2.Wrap(err, "failed to read response body")
+		return wrapReadBody(err)
 	}
-	logFields := []zapcore.Field{
+
+	logFields := []zap.Field{
 		zap.Int("status", rawResponse.StatusCode),
 		zap.String("method", http.MethodPost),
-		zap.String("path", url),
-		zap.ByteString("data", jsonData),
-		zap.String("header", headerSb.String()),
 		zap.Int64("latency_ms", time.Since(start).Milliseconds()),
-		zap.ByteString("response", bodyBytes),
 	}
-	if rawResponse.StatusCode == http.StatusOK {
-		c.dalLog.Info("PostJson", logFields...)
-		err = sonic.Unmarshal(bodyBytes, resp)
-		return err
-	} else {
-		c.dalLog.Warn("PostJson", logFields...)
-		return ErrFailedRequest
+	logFields = append(logFields, logutil.ZapTruncatedString("path", rawURL)...)
+	logFields = append(logFields, logutil.ZapTruncatedBytes("data", jsonData)...)
+	logFields = append(logFields, logutil.ZapTruncatedString("header", headerSb.String())...)
+	logFields = append(logFields, logutil.ZapTruncatedBytes("response", bodyBytes)...)
+
+	if !isSuccessStatus(rawResponse.StatusCode) {
+		c.warn("PostJson", logFields...)
+		return failedRequest(rawResponse.StatusCode, bodyBytes)
 	}
+	c.info("PostJson", logFields...)
+	if resp == nil || rawResponse.StatusCode == http.StatusNoContent || len(bodyBytes) == 0 {
+		return nil
+	}
+	return sonic.Unmarshal(bodyBytes, resp)
 }
 
-func (c *DalHttpClient) GetWithRetry(baseUrl string, params map[string]string, headers map[string]string, maxRetries int) ([]byte, error) {
-	fullUrl := baseUrl
-	if len(params) > 0 {
-		urlParams := url.Values{}
-		for k, v := range params {
-			urlParams.Add(k, v)
-		}
-		fullUrl = baseUrl + "?" + urlParams.Encode()
+// GetWithRetry issues a GET request and retries on network errors and
+// retryable statuses (429 / 5xx).
+//
+// maxAttempts is the total number of attempts, not the number of extra
+// retries: values below 1 are treated as a single attempt. When all attempts
+// are exhausted, the returned error is wrapped as "after %d attempts".
+func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params map[string]string, headers map[string]string, maxAttempts int) ([]byte, error) {
+	if c == nil || c.httpClient == nil {
+		return nil, ErrNilClient
 	}
-	req, err := http.NewRequest("GET", fullUrl, nil)
-	if err != nil {
-		return nil, err
+	fullURL := baseUrl
+	if len(params) > 0 {
+		u, err := url.Parse(baseUrl)
+		if err != nil {
+			return nil, err
+		}
+		q := u.Query()
+		for k, v := range params {
+			q.Set(k, v)
+		}
+		u.RawQuery = q.Encode()
+		fullURL = u.String()
 	}
 
-	// 构建请求头日志字符串
 	headerSb := strings.Builder{}
 	headerSb.Grow(len(headers) * 20)
-	if len(headers) > 0 {
-		for k, v := range headers {
-			req.Header.Add(k, v)
-			headerSb.WriteString(fmt.Sprintf("(%s:%s),", k, v))
-		}
+	for k, v := range headers {
+		headerSb.WriteByte('(')
+		headerSb.WriteString(k)
+		headerSb.WriteByte(':')
+		headerSb.WriteString(v)
+		headerSb.WriteString("),")
 	}
 	headerStr := headerSb.String()
 
+	attempts := max(maxAttempts, 1)
 	var lastErr error
-	for i := 0; i < maxRetries; i++ {
+	for i := range attempts {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
 		start := time.Now()
 		resp, err := c.httpClient.Do(req)
-		currentLatency := time.Since(start).Milliseconds()
-
+		latency := time.Since(start).Milliseconds()
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Millisecond * time.Duration(i+1*50)) // 指数退避
+			if ctx.Err() != nil {
+				return nil, ctxErrWithLast(ctx.Err(), lastErr)
+			}
+			if i == attempts-1 {
+				break
+			}
+			// The network-error retry path used to be completely silent
+			// (P3-4): warn once per retried attempt so operators can see the
+			// failed attempt (1-based), its latency and the underlying error.
+			c.warn("GetWithRetry",
+				zap.Int("attempt", i+1),
+				zap.Int64("latency_ms", latency),
+				zap.Error(err),
+			)
+			if waitErr := waitRetry(ctx, i); waitErr != nil {
+				return nil, ctxErrWithLast(waitErr, lastErr)
+			}
 			continue
 		}
 
-		// 读取响应体
-		bodyBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close() // 显式关闭body，避免循环中defer导致的资源泄露
-
+		bodyBytes, err := readLimitedBody(resp)
 		if err != nil {
-			lastErr = errors2.WithStack(err)
-			time.Sleep(time.Millisecond * time.Duration(i+1*50))
+			// MaxBytesError 不是瞬时故障：响应体已确定超限，重试也不会变小，
+			// 因此保持「立即返回、不打日志」。
+			if maxErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				return nil, fmt.Errorf("response body exceeds size limit (%d bytes): %w", maxErr.Limit, maxErr)
+			}
+			lastErr = err
+			if i == attempts-1 {
+				break
+			}
+			// 与网络错误重试路径（P3-4）同级：重试前 Warn 一次，字段同款
+			// （attempt / latency_ms / error），避免这条 body 读取失败的重试路径静默。
+			c.warn("GetWithRetry",
+				zap.Int("attempt", i+1),
+				zap.Int64("latency_ms", latency),
+				zap.Error(err),
+			)
+			if waitErr := waitRetry(ctx, i); waitErr != nil {
+				return nil, ctxErrWithLast(waitErr, lastErr)
+			}
 			continue
 		}
 
-		// 记录日志
-		logFields := []zapcore.Field{
+		logFields := []zap.Field{
 			zap.Int("status", resp.StatusCode),
-			zap.String("method", "GET"),
-			zap.String("path", fullUrl),
-			zap.String("header", headerStr),
-			zap.Int64("latency_ms", currentLatency),
-			zap.ByteString("response", bodyBytes),
+			zap.String("method", http.MethodGet),
+			zap.Int64("latency_ms", latency),
 		}
-		c.dalLog.Info("GetWithRetry", logFields...)
-		if resp.StatusCode == http.StatusOK {
+		logFields = append(logFields, logutil.ZapTruncatedString("path", fullURL)...)
+		logFields = append(logFields, logutil.ZapTruncatedString("header", headerStr)...)
+		logFields = append(logFields, logutil.ZapTruncatedBytes("response", bodyBytes)...)
+		// F-27：重试类失败状态（429/5xx）与网络错误路径（P3-4）同为 Warn 级，
+		// 便于基于级别的告警捕捉重试风暴；成功与其余 4xx 保持 Info。
+		if isRetryableStatus(resp.StatusCode) {
+			c.warn("GetWithRetry", logFields...)
+		} else {
+			c.info("GetWithRetry", logFields...)
+		}
+
+		if isSuccessStatus(resp.StatusCode) {
 			return bodyBytes, nil
 		}
 
-		lastErr = fmt.Errorf("url:(%s) status code:%d", fullUrl, resp.StatusCode)
-		time.Sleep(time.Millisecond * time.Duration(i+1*50))
+		lastErr = failedRequest(resp.StatusCode, bodyBytes)
+		if !isRetryableStatus(resp.StatusCode) {
+			return nil, lastErr
+		}
+		if i == attempts-1 {
+			break
+		}
+		if waitErr := waitRetry(ctx, i); waitErr != nil {
+			return nil, ctxErrWithLast(waitErr, lastErr)
+		}
 	}
 
-	return nil, errors2.WithStack(fmt.Errorf("after %d retries, last error: %v", maxRetries, lastErr))
+	if lastErr == nil {
+		lastErr = ErrFailedRequest
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", attempts, lastErr)
 }

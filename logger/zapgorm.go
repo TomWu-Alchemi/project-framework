@@ -26,12 +26,15 @@ type Logger struct {
 }
 
 func NewGormLogger(zapLogger *zap.Logger) Logger {
+	if zapLogger == nil {
+		zapLogger = zap.NewNop()
+	}
 	return Logger{
 		ZapLogger:                 zapLogger,
 		LogLevel:                  gormlogger.Warn,
 		SlowThreshold:             100 * time.Millisecond,
 		SkipCallerLookup:          false,
-		IgnoreRecordNotFoundError: false,
+		IgnoreRecordNotFoundError: true,
 		Context:                   nil,
 	}
 }
@@ -55,7 +58,7 @@ func (l Logger) Info(ctx context.Context, str string, args ...interface{}) {
 	if l.LogLevel < gormlogger.Info {
 		return
 	}
-	l.logger(ctx).Sugar().Debugf(str, args...)
+	l.logger(ctx).Sugar().Infof(str, args...)
 }
 
 func (l Logger) Warn(ctx context.Context, str string, args ...interface{}) {
@@ -77,27 +80,35 @@ func (l Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, i
 		return
 	}
 	elapsed := time.Since(begin)
+	logErr := err != nil && l.LogLevel >= gormlogger.Error &&
+		(!l.IgnoreRecordNotFoundError || !errors.Is(err, gorm.ErrRecordNotFound))
+	logSlow := l.SlowThreshold != 0 && elapsed > l.SlowThreshold && l.LogLevel >= gormlogger.Warn
+	logAll := l.LogLevel >= gormlogger.Info
+	if !logErr && !logSlow && !logAll {
+		return
+	}
 	logger := l.logger(ctx)
+	sql, rows := fc()
 	switch {
-	case err != nil && l.LogLevel >= gormlogger.Error && (!l.IgnoreRecordNotFoundError || !errors.Is(err, gorm.ErrRecordNotFound)):
-		sql, rows := fc()
+	case logErr:
 		logger.Error("trace", zap.Error(err), zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
-	case l.SlowThreshold != 0 && elapsed > l.SlowThreshold && l.LogLevel >= gormlogger.Warn:
-		sql, rows := fc()
+	case logSlow:
 		logger.Warn("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
-	case l.LogLevel >= gormlogger.Info:
-		sql, rows := fc()
-		logger.Debug("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
+	default:
+		logger.Info("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
 	}
 }
 
 var (
 	gormPackage    = filepath.Join("gorm.io", "gorm")
-	zapgormPackage = filepath.Join("moul.io", "zapgorm2")
+	zapgormPackage = filepath.Join("github.com", "TomWu-Alchemi", "project-framework", "logger")
 )
 
 func (l Logger) logger(ctx context.Context) *zap.Logger {
 	logger := l.ZapLogger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	if l.Context != nil {
 		fields := l.Context(ctx)
 		logger = logger.With(fields...)
@@ -114,6 +125,7 @@ func (l Logger) logger(ctx context.Context) *zap.Logger {
 		case strings.HasSuffix(file, "_test.go"):
 		case strings.Contains(file, gormPackage):
 		case strings.Contains(file, zapgormPackage):
+		case strings.HasSuffix(file, "zapgorm.go"):
 		default:
 			return logger.WithOptions(zap.AddCallerSkip(i))
 		}

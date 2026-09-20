@@ -53,11 +53,19 @@ func Failed2(endpoint string, code int, msg string, ext []Pair) CommonResponse {
 	}
 }
 
+// normalizeExtension 保证 extension 序列化为 JSON 数组 [] 而不是 null（P3-12）。
+func normalizeExtension(ext []Pair) []Pair {
+	if ext == nil {
+		return []Pair{}
+	}
+	return ext
+}
+
 func successResponseStatus(msg string, ext []Pair) ResponseStatus {
 	return ResponseStatus{
 		Code:      200,
 		Msg:       msg,
-		Extension: ext,
+		Extension: normalizeExtension(ext),
 	}
 }
 
@@ -65,6 +73,6 @@ func failedResponseStatus(code int, msg string, ext []Pair) ResponseStatus {
 	return ResponseStatus{
 		Code:      code,
 		Msg:       msg,
-		Extension: ext,
+		Extension: normalizeExtension(ext),
 	}
 }
