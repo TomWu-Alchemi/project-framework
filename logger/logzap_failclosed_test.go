@@ -219,7 +219,9 @@ func TestGinzap_TruncatedValidJSONFastPath(t *testing.T) {
 	if strings.Contains(out, "FASTPATH-SECRET") {
 		t.Fatalf("truncated JSON leaked plaintext password: %s", out)
 	}
-	if want := fmt.Sprintf("[filtered len=%d]", logutil.MaxLogBytes); !strings.Contains(out, want) {
+	// 占位 N 是日志口径的原始长度：httptest.NewRequest 对 *strings.Reader 精确设置
+	// ContentLength == len(body)，即 256KiB+2048，而不再是截断后的 256KiB 常量。
+	if want := fmt.Sprintf("[filtered len=%d]", len(body)); !strings.Contains(out, want) {
 		t.Fatalf("truncated JSON must emit %q without parsing, got: %s", want, out)
 	}
 	if strings.Contains(out, `"password":"******"`) {
@@ -230,7 +232,6 @@ func TestGinzap_TruncatedValidJSONFastPath(t *testing.T) {
 // P-1.6（c）：form 与 json 两条截断路径的占位格式逐字一致（[filtered len=N]）。
 func TestGinzap_TruncatedPlaceholderFormatConsistent(t *testing.T) {
 	const pad = 2048
-	want := fmt.Sprintf("[filtered len=%d]", logutil.MaxLogBytes)
 
 	placeholderOf := func(out string) string {
 		i := strings.Index(out, "[filtered len=")
@@ -261,22 +262,179 @@ func TestGinzap_TruncatedPlaceholderFormatConsistent(t *testing.T) {
 	jsonHead := `{"password":"CONSIST-SECRET","pad":"`
 	jsonBody := jsonHead + strings.Repeat("x", logutil.MaxLogBytes-len(jsonHead)+pad)
 
+	// 占位 N 取各自 body 的原始长度（= MaxLogBytes+pad）：httptest 对 *strings.Reader
+	// 设 ContentLength == len(body)，截断后 N 仍能还原，不再恒为 MaxLogBytes。
+	wantForm := fmt.Sprintf("[filtered len=%d]", len(formBody))
+	wantJSON := fmt.Sprintf("[filtered len=%d]", len(jsonBody))
+
 	formOut := run(t, "application/x-www-form-urlencoded", formBody)
 	if strings.Contains(formOut, "CONSIST-SECRET") {
 		t.Fatalf("form body leaked password: %s", formOut)
 	}
-	if got := placeholderOf(formOut); got != want {
-		t.Fatalf("form placeholder = %q, want %q\n%s", got, want, formOut)
+	if got := placeholderOf(formOut); got != wantForm {
+		t.Fatalf("form placeholder = %q, want %q\n%s", got, wantForm, formOut)
 	}
 
 	jsonOut := run(t, "application/json", jsonBody)
 	if strings.Contains(jsonOut, "CONSIST-SECRET") {
 		t.Fatalf("json body leaked password: %s", jsonOut)
 	}
-	if got := placeholderOf(jsonOut); got != want {
-		t.Fatalf("json placeholder = %q, want %q\n%s", got, want, jsonOut)
+	if got := placeholderOf(jsonOut); got != wantJSON {
+		t.Fatalf("json placeholder = %q, want %q\n%s", got, wantJSON, jsonOut)
 	}
 	if placeholderOf(formOut) != placeholderOf(jsonOut) {
 		t.Fatalf("form/json placeholder must be identical: form=%q json=%q", placeholderOf(formOut), placeholderOf(jsonOut))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F-20 批 3：Content-Type 缺失/非法 → 占位；未识别媒体类型 → 有意保留原文
+// ---------------------------------------------------------------------------
+
+// F-20：Content-Type 缺失时没有媒体类型可判定脱敏策略（ParseMediaType("") 返回
+// "mime: no media type"）；修复前该路径既不占位也不脱敏，含 password 的原文直接入库。
+func TestGinzap_MissingContentTypeBodyFailClosed(t *testing.T) {
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(Ginzap(zl, "", false))
+	r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body := `{"password":"NOCT-SECRET","user":"alice"}`
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+	// 刻意不设置 Content-Type
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	out := buf.String()
+	if strings.Contains(out, "NOCT-SECRET") {
+		t.Fatalf("body without Content-Type leaked plaintext password: %s", out)
+	}
+	if want := fmt.Sprintf("[filtered len=%d]", len(body)); !strings.Contains(out, want) {
+		t.Fatalf("expected placeholder %q for body without Content-Type, got: %s", want, out)
+	}
+}
+
+// F-20：Content-Type 非法（ParseMediaType 报错）同样占位。注意 "json" 这类漏斜杠的值
+// err == nil、不属于本用例覆盖面（见下方边界锁定用例）。
+func TestGinzap_InvalidContentTypeBodyFailClosed(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+	}{
+		{"invalid-token", "not a media type"}, // expected slash after first token
+		{"missing-subtype", "application/"},   // expected token after slash
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			zl, buf := ginZapBuffer(t)
+			r := gin.New()
+			r.Use(Ginzap(zl, "", false))
+			r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+			body := `{"password":"BADCT-SECRET","user":"alice"}`
+			req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+			req.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			out := buf.String()
+			if strings.Contains(out, "BADCT-SECRET") {
+				t.Fatalf("invalid Content-Type %q leaked plaintext password: %s", tc.contentType, out)
+			}
+			if want := fmt.Sprintf("[filtered len=%d]", len(body)); !strings.Contains(out, want) {
+				t.Fatalf("expected placeholder %q for invalid Content-Type %q, got: %s", want, tc.contentType, out)
+			}
+		})
+	}
+}
+
+// 【边界锁定 · 有意行为固化】未识别媒体类型保持原文记录：主管确认、项目负责人拍板的
+// 方案 B 取舍——保留非结构化 body 的排障信息。已知代价：multipart 正常表单提交
+// （Content-Type: multipart/form-data）中的 password 字段仍会明文入库，作为后续独立
+// 事项评估。未来若改为占位，必须同步修改本用例并重新评审。
+//
+// visible 用不含 & " < > 的片段，避免编码器转义差异带来的断言噪音；断言"能看到
+// password 明文"正是本取舍的表现，不是缺陷。
+func TestGinzap_UnrecognizedMediaTypeKeepsPlaintext(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		visible     string
+	}{
+		{"text-plain", "text/plain", "password=PLAIN-SECRET", "password=PLAIN-SECRET"},
+		{"multipart-form-data", "multipart/form-data; boundary=XyZ123", "password=MULTIPART-SECRET", "password=MULTIPART-SECRET"},
+		// 漏斜杠的 "json"：ParseMediaType 成功（err == nil）但媒体类型未识别 → 保持原文。
+		{"no-slash-json", "json", `{"password":"NOSLASH-SECRET"}`, "NOSLASH-SECRET"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			zl, buf := ginZapBuffer(t)
+			r := gin.New()
+			r.Use(Ginzap(zl, "", false))
+			r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+			req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			out := buf.String()
+			if strings.Contains(out, "[filtered len=") {
+				t.Fatalf("unrecognized media type %q must keep the body as-is: %s", tc.contentType, out)
+			}
+			if !strings.Contains(out, tc.visible) {
+				t.Fatalf("unrecognized media type %q must keep original text %q visible: %s", tc.contentType, tc.visible, out)
+			}
+		})
+	}
+}
+
+// F-20 回归：空 body（无 Content-Type 的 GET）不得凭空产生 body 字段或占位符。
+func TestGinzap_EmptyBodyEmitsNoBodyField(t *testing.T) {
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(Ginzap(zl, "", false))
+	r.GET("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	out := buf.String()
+	for _, forbidden := range []string{"[filtered len=", `"body":`, "body_truncated", "body_size"} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("empty body must not produce %q: %s", forbidden, out)
+		}
+	}
+}
+
+// F-20 + body_size 修正：chunked（ContentLength 未知，显式 -1）+ 无 Content-Type +
+// 大 body：占位 N 与 body_size 都必须是"已读到的下界"（MaxLogBytes），而不是占位符
+// 自身长度——否则 body_truncated=true 与 body_size≈22 自相矛盾。
+func TestGinzap_TruncatedUnknownLengthBodySizeIsBytesRead(t *testing.T) {
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(Ginzap(zl, "", false))
+	r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body := `{"password":"CHUNKED-SECRET","pad":"` + strings.Repeat("x", logutil.MaxLogBytes+2048) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+	req.ContentLength = -1 // 模拟 chunked：长度未知
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	out := buf.String()
+	if strings.Contains(out, "CHUNKED-SECRET") {
+		t.Fatalf("truncated body leaked plaintext password: %s", out)
+	}
+	if want := fmt.Sprintf("[filtered len=%d]", logutil.MaxLogBytes); !strings.Contains(out, want) {
+		t.Fatalf("placeholder must use the bytes actually read (%d), got: %s", logutil.MaxLogBytes, out)
+	}
+	if !strings.Contains(out, `"body_truncated":true`) {
+		t.Fatalf("expected body_truncated=true: %s", out)
+	}
+	if want := fmt.Sprintf(`"body_size":%d`, logutil.MaxLogBytes); !strings.Contains(out, want) {
+		t.Fatalf("body_size must be the bytes actually read (%d), not the placeholder length: %s", logutil.MaxLogBytes, out)
 	}
 }

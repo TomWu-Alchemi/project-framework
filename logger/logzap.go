@@ -122,31 +122,57 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 		bodyStr := ""
 		var bodyReadErr error
 		var bodyTruncatedAtRead bool
+		// bodyOriginalLen 是"日志口径的原始 body 长度"，供占位符 N 与下方 body_size 复用。
+		// 未截断时即 len(bodyStr)；截断时 bodyStr 只剩已读前缀（恒为 MaxLogBytes），
+		// 需要用 ContentLength 尽量还原真实长度；ContentLength 不可用（未知为 -1，
+		// 或不大于已读前缀）时退化为已读到的下界。必须在本块内、bodyStr 被占位/脱敏
+		// 替换之前算出——替换后 len(bodyStr) 不再代表原始长度。
+		bodyOriginalLen := 0
 		if !skipByPath {
 			var logged []byte
 			logged, bodyTruncatedAtRead, bodyReadErr = snapshotRequestBody(c.Request)
 			bodyStr = string(logged)
-			mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
-			// F-20（fail closed）：非明文编码（gzip 等）与截断的 form 无法可靠脱敏，
-			// 一律占位、禁止回显原文，与 filterSensitiveQuery 对不可解析 query 的 P3-10 取舍一致。
-			if enc := c.GetHeader("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-				bodyStr = fmt.Sprintf("[filtered len=%d]", len(bodyStr))
-			} else if err == nil {
-				switch mediaType {
-				case "application/x-www-form-urlencoded":
-					if bodyTruncatedAtRead {
-						// 截断点可能落在 password 值中间，值前缀仍会泄漏
-						bodyStr = fmt.Sprintf("[filtered len=%d]", len(bodyStr))
-					} else {
-						bodyStr = filterSensitiveData(bodyStr)
-					}
-				case "application/json":
-					if bodyTruncatedAtRead {
-						// 截断的 JSON 解析必然失败（scan 到截断点才报错），
-						// 与 form 分支一致直接占位，省掉一次必然失败的解析（P-1.6）。
-						bodyStr = fmt.Sprintf("[filtered len=%d]", len(bodyStr))
-					} else {
-						bodyStr = filterSensitiveDataForJson(bodyStr)
+			bodyOriginalLen = len(bodyStr)
+			if bodyTruncatedAtRead {
+				if cl := c.Request.ContentLength; cl > int64(bodyOriginalLen) {
+					bodyOriginalLen = int(cl)
+				}
+			}
+			// 空 body（如未带 Content-Type 的 GET）不占位、不脱敏，保持空串：
+			// 否则会凭空多出 "body":"[filtered len=0]" 字段，污染全量访问日志。
+			if bodyStr != "" {
+				mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+				// F-20（fail closed）：非明文编码（gzip 等）、Content-Type 缺失/非法、
+				// 截断的 form/json 都无法可靠脱敏，一律占位、禁止回显原文，与
+				// filterSensitiveQuery 对不可解析 query 的 P3-10 取舍一致。
+				if enc := c.GetHeader("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+					bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+				} else if err != nil {
+					// Content-Type 缺失或非法：没有媒体类型可用于选择脱敏策略，原文
+					// 可能含 password 明文，一律占位（修复前这条路径会原样回显原文）。
+					bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+				} else {
+					switch mediaType {
+					case "application/x-www-form-urlencoded":
+						if bodyTruncatedAtRead {
+							// 截断点可能落在 password 值中间，值前缀仍会泄漏
+							bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+						} else {
+							bodyStr = filterSensitiveData(bodyStr)
+						}
+					case "application/json":
+						if bodyTruncatedAtRead {
+							// 截断的 JSON 解析必然失败（scan 到截断点才报错），
+							// 与 form 分支一致直接占位，省掉一次必然失败的解析（P-1.6）。
+							bodyStr = fmt.Sprintf("[filtered len=%d]", bodyOriginalLen)
+						} else {
+							bodyStr = filterSensitiveDataForJson(bodyStr)
+						}
+					default:
+						// 有意保留原文：未识别的媒体类型（multipart/form-data、text/*，以及
+						// `json` 这类 ParseMediaType 成功但非合法 MIME 形态的值）不做占位，
+						// 保住非结构化 body 的排障信息。已知取舍：multipart 正常表单提交的
+						// password 字段仍会明文入库，作为后续独立事项评估；本处不要改为占位。
 					}
 				}
 			}
@@ -187,9 +213,11 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 				loggedBody, bodyTruncated, bodySize := logutil.TruncateString(bodyStr)
 				if bodyTruncatedAtRead {
 					bodyTruncated = true
-					if cl := c.Request.ContentLength; cl > int64(bodySize) {
-						bodySize = int(cl)
-					}
+					// 截断时 bodyStr 可能是占位符（20 余字节），TruncateString 给出的
+					// bodySize 会取到占位符自身长度，与 body_truncated=true 自相矛盾；
+					// 统一改用日志口径的原始长度（已在上方按 ContentLength 修正，
+					// 长度未知时退化为已读到的下界）。
+					bodySize = bodyOriginalLen
 				}
 				fields = append(fields,
 					zap.String("body", loggedBody),
