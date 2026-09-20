@@ -3,6 +3,7 @@ package logger
 // F-20 / F-21 验收测试：脱敏路径 fail closed、panic 恢复日志脱敏。
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,18 @@ import (
 	"github.com/TomWu-Alchemi/project-framework/internal/logutil"
 	"github.com/gin-gonic/gin"
 )
+
+// loggedBodyField 从单行访问日志中取出 body 字段的原始（已反序列化）文本，
+// 供需要逐字断言脱敏结果的用例使用——直接对日志行做子串匹配会被 JSON 转义干扰。
+func loggedBodyField(t *testing.T, out string) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &m); err != nil {
+		t.Fatalf("access log line is not valid JSON: %v\n%s", err, out)
+	}
+	s, _ := m["body"].(string)
+	return s
+}
 
 // wrappedOpError 构造一个外层包装过的 *net.OpError（broken pipe），
 // 直接类型断言无法识别，errors.As 才能命中（F-30 的识别面）。
@@ -348,24 +361,237 @@ func TestGinzap_InvalidContentTypeBodyFailClosed(t *testing.T) {
 	}
 }
 
-// 【边界锁定 · 有意行为固化】未识别媒体类型保持原文记录：主管确认、项目负责人拍板的
-// 方案 B 取舍——保留非结构化 body 的排障信息。已知代价：multipart 正常表单提交
-// （Content-Type: multipart/form-data）中的 password 字段仍会明文入库，作为后续独立
-// 事项评估。未来若改为占位，必须同步修改本用例并重新评审。
-//
-// visible 用不含 & " < > 的片段，避免编码器转义差异带来的断言噪音；断言"能看到
-// password 明文"正是本取舍的表现，不是缺陷。
-func TestGinzap_UnrecognizedMediaTypeKeepsPlaintext(t *testing.T) {
+// ---------------------------------------------------------------------------
+// 【策略变更（已拍板）】未识别媒体类型保持原文，但写入日志前统一做“未掩码 password
+// 兜底检测”，命中即占位。原先“未识别类型保持明文”的用例已推翻。
+// ---------------------------------------------------------------------------
+
+// 验收 1/2/3/4/8：未识别媒体类型（或声明类型与实际 body 不符）时，只要 body 里存在
+// 未掩码的 password 值，就必须占位且不得出现明文；body_size 恒为原始 body 长度。
+func TestGinzap_UnmaskedPasswordIsRedactedAcrossMediaTypes(t *testing.T) {
 	cases := []struct {
 		name        string
 		contentType string
 		body        string
-		visible     string
+		secret      string
 	}{
-		{"text-plain", "text/plain", "password=PLAIN-SECRET", "password=PLAIN-SECRET"},
-		{"multipart-form-data", "multipart/form-data; boundary=XyZ123", "password=MULTIPART-SECRET", "password=MULTIPART-SECRET"},
-		// 漏斜杠的 "json"：ParseMediaType 成功（err == nil）但媒体类型未识别 → 保持原文。
-		{"no-slash-json", "json", `{"password":"NOSLASH-SECRET"}`, "NOSLASH-SECRET"},
+		{
+			// 验收 1：text/plain 声明 + JSON body。
+			name:        "text-plain-json-body",
+			contentType: "text/plain",
+			body:        `{"password":"PLAINTEXT-SECRET","user":"alice"}`,
+			secret:      "PLAINTEXT-SECRET",
+		},
+		{
+			// 验收 2：multipart/form-data，含 name="password" 字段（该路径不脱敏）。
+			name:        "multipart-form-data",
+			contentType: "multipart/form-data; boundary=XyZ123",
+			body:        "--XyZ123\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nMULTIPART-SECRET\r\n--XyZ123--\r\n",
+			secret:      "MULTIPART-SECRET",
+		},
+		{
+			// 验收 3：漏斜杠的 "json"——ParseMediaType 成功（err == nil）但媒体类型未识别。
+			name:        "no-slash-json",
+			contentType: "json",
+			body:        `{"password":"NOSLASH-SECRET"}`,
+			secret:      "NOSLASH-SECRET",
+		},
+		{
+			// 验收 4：声明 form-urlencoded 但实际 body 是 JSON——filterSensitiveData
+			// 切不出 k=v，会原样输出，靠兜底断言占位。
+			name:        "form-declared-json-body",
+			contentType: "application/x-www-form-urlencoded",
+			body:        `{"password":"MISMATCH-SECRET","user":"alice"}`,
+			secret:      "MISMATCH-SECRET",
+		},
+		{
+			// 补充：未识别类型 + form 形态。
+			name:        "octet-stream-form-body",
+			contentType: "application/octet-stream",
+			body:        "user=alice&password=OCTET-SECRET",
+			secret:      "OCTET-SECRET",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			zl, buf := ginZapBuffer(t)
+			r := gin.New()
+			r.Use(Ginzap(zl, "", false))
+			r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+			req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			out := buf.String()
+			if strings.Contains(out, tc.secret) {
+				t.Fatalf("%s (%s) leaked plaintext password: %s", tc.name, tc.contentType, out)
+			}
+			if want := fmt.Sprintf("[filtered len=%d]", len(tc.body)); !strings.Contains(out, want) {
+				t.Fatalf("%s (%s) must emit placeholder %q, got: %s", tc.name, tc.contentType, want, out)
+			}
+			// 验收 8：body_size 恒为原始 body 长度（占位场景等于占位符 N）。
+			if want := fmt.Sprintf(`"body_size":%d`, len(tc.body)); !strings.Contains(out, want) {
+				t.Fatalf("%s: body_size must be original body length (%d), got: %s", tc.name, len(tc.body), out)
+			}
+		})
+	}
+}
+
+// 验收 5【“禁止按内容类型粗放占位”红线保护用例之一】：text/plain 不带未掩码 password
+// 时必须逐字保留原文、不得占位；含 password 一词而下一位既非 '"' 也非 '='（无值可判定）
+// 同样不得占位。断言取 body 字段的完整还原值 == 原始 body（而非片段包含）。
+func TestGinzap_PasswordlessTextPlainKeepsPlaintext(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"plain-text", "hello world"},
+		{"word-only-password", "please reset your password as soon as possible"},
+		{"json-password-policy", `{"password_policy":"must-be-long"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			zl, buf := ginZapBuffer(t)
+			r := gin.New()
+			r.Use(Ginzap(zl, "", false))
+			r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+			req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "text/plain")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			out := buf.String()
+			if strings.Contains(out, "[filtered len=") {
+				t.Fatalf("%s: passwordless text/plain must NOT be placeholdered: %s", tc.name, out)
+			}
+			if logged := loggedBodyField(t, out); logged != tc.body {
+				t.Fatalf("%s: body must be kept verbatim\n got %q\nwant %q", tc.name, logged, tc.body)
+			}
+		})
+	}
+}
+
+// 验收 10【“禁止按内容类型粗放占位”红线保护用例之二】：multipart/form-data 不含 password
+// 字段时必须逐字保留原文、不得占位。与 TestGinzap_UnmaskedPasswordIsRedactedAcrossMediaTypes
+// 的 multipart-form-data 子用例配对——同样是 multipart，是否占位只取决于内容中是否存在
+// 未掩码 password，与媒体类型无关（不存在“是 multipart 就占位”的粗放规则）。
+func TestGinzap_PasswordlessMultipartKeepsPlaintext(t *testing.T) {
+	const body = "------boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.xlsx\"\r\n\r\nDATA\r\n------boundary--\r\n"
+
+	zl, buf := ginZapBuffer(t)
+	r := gin.New()
+	r.Use(Ginzap(zl, "", false))
+	r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=------boundary")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	out := buf.String()
+	if strings.Contains(out, "[filtered len=") {
+		t.Fatalf("passwordless multipart must NOT be placeholdered: %s", out)
+	}
+	if logged := loggedBodyField(t, out); logged != body {
+		t.Fatalf("passwordless multipart body must be kept verbatim\n got %q\nwant %q", logged, body)
+	}
+	if !strings.Contains(out, "a.xlsx") {
+		t.Fatalf("non-sensitive multipart content must stay visible: %s", out)
+	}
+}
+
+// 主管审查（第一轮）补漏：四类此前漏判的未掩码形态，各补一条端到端用例。每例断言
+// 不出现明文、出现占位符、且 body_size 为原始 body 长度。
+func TestGinzap_ExtendedPasswordFormsAreRedacted(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		secret      string
+	}{
+		{
+			// 修 A-1：multipart 参数 '=' 两侧带空白（合法 MIME 参数语法，标准解析器
+			// 能取出该字段，业务收到密码 → 必须占位）。
+			name:        "multipart-name-equals-with-ws",
+			contentType: "multipart/form-data; boundary=b",
+			body:        "--b\r\nContent-Disposition: form-data; name = \"password\"\r\n\r\nSECRET\r\n--b--\r\n",
+			secret:      "SECRET",
+		},
+		{
+			// 修 A-2：multipart 参数名单引号（合法 MIME 参数语法）。
+			name:        "multipart-name-single-quote",
+			contentType: "multipart/form-data; boundary=b",
+			body:        "--b\r\nContent-Disposition: form-data; name='password'\r\n\r\nSECRET\r\n--b--\r\n",
+			secret:      "SECRET",
+		},
+		{
+			// 修 B-1：对象字面量无引号 key（前端畸形 body 常见形态）。
+			name:        "unquoted-key-object-literal",
+			contentType: "text/plain",
+			body:        `{password:"SECRET"}`,
+			secret:      "SECRET",
+		},
+		{
+			// 修 B-2：'password: 值' 冒号分隔（YAML / 配置 / 头风格）。
+			name:        "colon-separated-plain",
+			contentType: "text/plain",
+			body:        "password: SECRET",
+			secret:      "SECRET",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			zl, buf := ginZapBuffer(t)
+			r := gin.New()
+			r.Use(Ginzap(zl, "", false))
+			r.POST("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+			req := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			out := buf.String()
+			if strings.Contains(out, tc.secret) {
+				t.Fatalf("%s leaked plaintext password: %s", tc.name, out)
+			}
+			if want := fmt.Sprintf("[filtered len=%d]", len(tc.body)); !strings.Contains(out, want) {
+				t.Fatalf("%s must emit placeholder %q, got: %s", tc.name, want, out)
+			}
+			if want := fmt.Sprintf(`"body_size":%d`, len(tc.body)); !strings.Contains(out, want) {
+				t.Fatalf("%s: body_size must be original body length (%d), got: %s", tc.name, len(tc.body), out)
+			}
+		})
+	}
+}
+
+// 验收 6/7/8：正常 JSON / form 路径仍输出掩码字面量、不占位，body_size 为原始长度
+// （而不是脱敏后长度）。
+func TestGinzap_MaskedBodyStillLoggedWithoutPlaceholder(t *testing.T) {
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+		masked      string
+		keep        string
+	}{
+		{
+			name:        "valid-json",
+			contentType: "application/json",
+			body:        `{"password":"VALID-SECRET","user":"alice"}`,
+			masked:      `"password":"******"`,
+			keep:        "alice",
+		},
+		{
+			name:        "valid-form",
+			contentType: "application/x-www-form-urlencoded",
+			body:        "user=alice&password=FORM-SECRET",
+			masked:      "password=******",
+			keep:        "user=alice",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,12 +607,81 @@ func TestGinzap_UnrecognizedMediaTypeKeepsPlaintext(t *testing.T) {
 
 			out := buf.String()
 			if strings.Contains(out, "[filtered len=") {
-				t.Fatalf("unrecognized media type %q must keep the body as-is: %s", tc.contentType, out)
+				t.Fatalf("%s must NOT be placeholdered: %s", tc.name, out)
 			}
-			if !strings.Contains(out, tc.visible) {
-				t.Fatalf("unrecognized media type %q must keep original text %q visible: %s", tc.contentType, tc.visible, out)
+			logged := loggedBodyField(t, out)
+			if !strings.Contains(logged, tc.masked) {
+				t.Fatalf("%s must contain masked literal %q, got body %q (log=%s)", tc.name, tc.masked, logged, out)
+			}
+			if !strings.Contains(logged, tc.keep) {
+				t.Fatalf("%s must keep non-sensitive field %q, got body %q (log=%s)", tc.name, tc.keep, logged, out)
+			}
+			// 验收 8：body_size 为原始 body 长度（若沿用脱敏后长度会与 -- 不同）。
+			if want := fmt.Sprintf(`"body_size":%d`, len(tc.body)); !strings.Contains(out, want) {
+				t.Fatalf("%s: body_size must be original body length (%d), not masked length, got: %s", tc.name, len(tc.body), out)
 			}
 		})
+	}
+}
+
+// hasUnmaskedPassword 判据单元测试：锁定“命中即占位、已掩码/无值不占位、无语义不误判”。
+func TestHasUnmaskedPassword(t *testing.T) {
+	leaked := []string{
+		`{"password":"SECRET"}`,
+		`{"Password":"SECRET"}`,
+		`{"a":{"b":[{"password":"SECRET"}]}}`,
+		`{"password":"a\"b"}`, // 值含转义引号
+		`{"password":"SECRET`, // 截断未闭合
+		`{"password":123456}`, // 非字符串值（fail closed）
+		"password=SECRET",
+		"user=alice&Password=SECRET",
+		"password=SECRET&token=t",
+		"--b\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nSECRET\r\n--b--\r\n",
+		`name="password"`,
+		// 修 A：multipart 参数 '=' 两侧空白 / 单引号。
+		"--b\r\nContent-Disposition: form-data; name = \"password\"\r\n\r\nSECRET\r\n--b--\r\n",
+		"--b\r\nContent-Disposition: form-data; name='password'\r\n\r\nSECRET\r\n--b--\r\n",
+		`name = 'password'`,
+		// 修 B：无引号 key 对象字面量 / ':' 分隔（含 ':' 前空白）。
+		`{password:"SECRET"}`,
+		"password: SECRET",
+		"password : SECRET",
+		// 同族加固：无引号 token 形态（MIME 合法）、单引号对象 key、非词边界的嵌套 key。
+		"--b\r\nContent-Disposition: form-data; name=password\r\n\r\nSECRET\r\n--b--\r\n",
+		`{'password': 'x'}`,
+		"user.password=x", // 既有保守行为：'.' 非词边界仍按字段处理（主管裁定保留）
+	}
+	for _, s := range leaked {
+		if !hasUnmaskedPassword(s) {
+			t.Errorf("must be flagged as unmasked password: %q", s)
+		}
+	}
+	safe := []string{
+		"",
+		"hello world",
+		"please reset your password now",
+		"please reset your password as soon as possible",
+		`{"password":"******"}`,
+		`{"password":""}`,
+		`{"password":null}`,
+		`{"password"}`, // 引号后是 '}'（非参数边界）→ 不占位
+		`{password:""}`,
+		`{'password':''}`,
+		`{"password_policy":"x"}`,
+		`{"mypassword":"x"}`,
+		"password=******",
+		"password=",
+		"user=alice&password=******",
+		"password", // 仅单词、无可判定值
+		"password:",
+		"password: ",
+		`<input name="password">`, // name="password" 之后非参数边界 → 不按 multipart 占位
+		`name="file"`,             // 无 password 字段
+	}
+	for _, s := range safe {
+		if hasUnmaskedPassword(s) {
+			t.Errorf("must NOT be flagged: %q", s)
+		}
 	}
 }
 
