@@ -2,6 +2,8 @@
 
 要求 **Go 1.26.8** 或更高（见 `go.mod` 的 `go` 行）。下游在默认 `GOTOOLCHAIN=auto` 下会按该版本选取工具链。
 
+变更记录见 [CHANGELOG.md](CHANGELOG.md)；升级前请先阅读其中的「不兼容变更」与「迁移清单」。
+
 代码审查与修复方案：[docs/code-review.md](docs/code-review.md)（含问题清单、分批修复方案与决策记录）。
 
 建议 Init 顺序：先 `logger.InitLogger()`，再 `cacheproxy.Init` / NATS。`CacheContext` 的 TTL 与 refresh offset **小于等于 0 表示使用默认值**（过期 24h、空值 1m、逻辑刷新 10m），不是「永不过期」或「KEEPTTL / 立即回源」；该约定对直接调用 `RedisCache.Set` 同样生效，`httpclient.NewDalHttpClient` 的 `Timeout` 小于等于 0 时回退为 10s，其 `DalLog` 为 nil 表示**不记录任何 DAL 日志**（DAL 日志为全量请求/响应记录，属显式 opt-in：未注入时不产生日志、不占用全局日志通道）。访问日志仍打 header/body/query，过大截断为 256KiB；`Content-Type` 缺失或非法（`mime.ParseMediaType` 报错）时 body 以 `[filtered len=N]` 占位（`N` 为原始长度，截断时按 `Content-Length` 尽量还原，长度未知则退化为已读下界）；未识别 `Content-Type`（如 multipart/form-data、text/*）保持原文记录，但写入日志前统一做「未掩码 password 兜底检测」，命中即改为 `[filtered len=N]` 占位（判据覆盖带引号 key `"password":"值"`、无引号 key `password:"值"` / `password: 值`、form/query `password=值`、multipart `name = "password"` / `name='password'`（`=` 两侧可带空白、单双引号均可）；取值恰为 `******` 或无可判定值时不占位）。访问日志 `body_size` 恒为原始 body 长度（截断时按 `Content-Length` 还原、长度未知则为已读下界），与 `body_truncated`（是否在读取阶段被截断）语义解耦。`logger.InitLoggerWithConfig` 可配置 JSON 编码、目录、info/error/access/panic 是否同时写 stdout、lumberjack Compress、`DisableCaller`（关掉文件:行号以省掉每条日志的栈回溯），以及 `BufferSize` / `BufferFlushInterval`（文件侧内存缓冲：零值默认关闭、即同步写；只缓冲 lumberjack 文件侧，stdout 始终同步；`BufferFlushInterval` 零值回退 100ms（本库语义）；打开后进程崩溃可能丢失缓冲区）。`InitLogger()` 行为不变。热路径可用 `logger.GetLogger()` 打 `zap.Field`。`cacheproxy.WithLogger` 可为代理注入 `*zap.Logger`（nil 表示继续使用全局 logger）。已取消的 `GetHit` 调用方立即返回，不再等待共享回源结束；回源仍会跑完以服务同 key 的其他等待者。
