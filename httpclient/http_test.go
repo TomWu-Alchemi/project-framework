@@ -1,9 +1,9 @@
 package httpclient
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +12,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 type infiniteReader struct{}
@@ -40,6 +43,26 @@ func TestNewDalHttpClient_ClonesDefaultTransport(t *testing.T) {
 	}
 	if tr.MaxIdleConnsPerHost != 100 {
 		t.Fatalf("MaxIdleConnsPerHost=%d", tr.MaxIdleConnsPerHost)
+	}
+}
+
+func TestNewDalHttpClient_DefaultTimeout(t *testing.T) {
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{"零值回退为 10s", 0, 10 * time.Second},
+		{"负数回退为 10s", -1, 10 * time.Second},
+		{"正值保持", 3 * time.Second, 3 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewDalHttpClient(DalHttpClientConf{Timeout: tt.timeout})
+			if got := c.httpClient.Timeout; got != tt.want {
+				t.Fatalf("httpClient.Timeout = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -218,7 +241,7 @@ func TestGetWithRetry_4xxNoRetry(t *testing.T) {
 	}
 }
 
-func TestGetWithRetry_MaxRetriesLessThanOneMeansOnce(t *testing.T) {
+func TestGetWithRetry_MaxAttemptsLessThanOneMeansOnce(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -249,12 +272,75 @@ func TestGetWithRetry_429Retries(t *testing.T) {
 	if !errors.Is(err, ErrFailedRequest) {
 		t.Fatalf("got %v", err)
 	}
+	// P3-3: the wording now counts attempts, not retries.
+	if !strings.HasPrefix(err.Error(), "after 2 attempts: ") {
+		t.Fatalf("error = %v, want prefix %q", err, "after 2 attempts: ")
+	}
 }
 
-func TestTruncateBytes(t *testing.T) {
-	in := bytes.Repeat([]byte("a"), maxLogBytes+10)
-	logged, trunc, size := truncateBytes(in)
-	if !trunc || size != maxLogBytes+10 || len(logged) != maxLogBytes {
-		t.Fatalf("len=%d trunc=%v size=%d", len(logged), trunc, size)
+func TestGetWithRetry_NetworkErrorWarnsBeforeRetry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	// Closed immediately: every attempt fails with a network error.
+	srv.Close()
+
+	core, observed := observer.New(zap.WarnLevel)
+	c := NewDalHttpClient(DalHttpClientConf{
+		Timeout: 5 * time.Second,
+		DalLog:  zap.New(core),
+	})
+
+	_, err := c.GetWithRetry(t.Context(), srv.URL, nil, nil, 2)
+	if err == nil {
+		t.Fatal("expected a network error from the closed server")
+	}
+	if !strings.HasPrefix(err.Error(), "after 2 attempts: ") {
+		t.Fatalf("error = %v, want prefix %q", err, "after 2 attempts: ")
+	}
+
+	logs := observed.All()
+	// Only the attempt that is actually retried is warned about; the final
+	// failure is returned to the caller as the wrapped error.
+	if len(logs) != 1 {
+		t.Fatalf("warn entries = %d, want 1", len(logs))
+	}
+	entry := logs[0]
+	if entry.Level != zap.WarnLevel || entry.Message != "GetWithRetry" {
+		t.Fatalf("level=%v message=%q", entry.Level, entry.Message)
+	}
+	got := entry.ContextMap()
+	if attempt := got["attempt"]; attempt != int64(1) {
+		t.Fatalf("attempt = %v (%T), want 1", attempt, attempt)
+	}
+	if ms, ok := got["latency_ms"].(int64); !ok || ms < 0 {
+		t.Fatalf("latency_ms = %v, want non-negative int64", got["latency_ms"])
+	}
+	// zapcore.ErrorType rendering depends on zap internals: require the key
+	// to be present with a non-empty rendered value.
+	if s := fmt.Sprint(got["error"]); s == "" {
+		t.Fatalf("error field missing or empty: %v", got)
+	}
+}
+
+func TestPostJson_NilClient(t *testing.T) {
+	err := (*DalHttpClient)(nil).PostJson(t.Context(), "http://example.com", nil, map[string]int{"n": 1}, nil)
+	if !errors.Is(err, ErrNilClient) {
+		t.Fatalf("nil receiver err=%v", err)
+	}
+	err = (&DalHttpClient{}).PostJson(t.Context(), "http://example.com", nil, map[string]int{"n": 1}, nil)
+	if !errors.Is(err, ErrNilClient) {
+		t.Fatalf("nil httpClient err=%v", err)
+	}
+}
+
+func TestGetWithRetry_NilClient(t *testing.T) {
+	_, err := (*DalHttpClient)(nil).GetWithRetry(t.Context(), "http://example.com", nil, nil, 1)
+	if !errors.Is(err, ErrNilClient) {
+		t.Fatalf("nil receiver err=%v", err)
+	}
+	_, err = (&DalHttpClient{}).GetWithRetry(t.Context(), "http://example.com", nil, nil, 1)
+	if !errors.Is(err, ErrNilClient) {
+		t.Fatalf("nil httpClient err=%v", err)
 	}
 }

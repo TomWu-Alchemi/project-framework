@@ -1,7 +1,6 @@
 package rpc
 
 import (
-	"bytes"
 	"context"
 	"testing"
 
@@ -76,13 +75,5 @@ func TestNatsRpcAccessLog_NilLoggerNoPanic(t *testing.T) {
 	h(t.Context(), &fakeRequest{subject: "svc.ok"})
 	if !called {
 		t.Fatal("handler not called")
-	}
-}
-
-func TestTruncateBytes(t *testing.T) {
-	in := bytes.Repeat([]byte("x"), maxLogBytes+5)
-	logged, trunc, size := truncateBytes(in)
-	if !trunc || size != maxLogBytes+5 || len(logged) != maxLogBytes {
-		t.Fatalf("len=%d trunc=%v size=%d", len(logged), trunc, size)
 	}
 }

@@ -26,6 +26,9 @@ type Logger struct {
 }
 
 func NewGormLogger(zapLogger *zap.Logger) Logger {
+	if zapLogger == nil {
+		zapLogger = zap.NewNop()
+	}
 	return Logger{
 		ZapLogger:                 zapLogger,
 		LogLevel:                  gormlogger.Warn,
@@ -77,16 +80,21 @@ func (l Logger) Trace(ctx context.Context, begin time.Time, fc func() (string, i
 		return
 	}
 	elapsed := time.Since(begin)
+	logErr := err != nil && l.LogLevel >= gormlogger.Error &&
+		(!l.IgnoreRecordNotFoundError || !errors.Is(err, gorm.ErrRecordNotFound))
+	logSlow := l.SlowThreshold != 0 && elapsed > l.SlowThreshold && l.LogLevel >= gormlogger.Warn
+	logAll := l.LogLevel >= gormlogger.Info
+	if !logErr && !logSlow && !logAll {
+		return
+	}
 	logger := l.logger(ctx)
+	sql, rows := fc()
 	switch {
-	case err != nil && l.LogLevel >= gormlogger.Error && (!l.IgnoreRecordNotFoundError || !errors.Is(err, gorm.ErrRecordNotFound)):
-		sql, rows := fc()
+	case logErr:
 		logger.Error("trace", zap.Error(err), zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
-	case l.SlowThreshold != 0 && elapsed > l.SlowThreshold && l.LogLevel >= gormlogger.Warn:
-		sql, rows := fc()
+	case logSlow:
 		logger.Warn("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
-	case l.LogLevel >= gormlogger.Info:
-		sql, rows := fc()
+	default:
 		logger.Info("trace", zap.Duration("elapsed", elapsed), zap.Int64("rows", rows), zap.String("sql", sql))
 	}
 }
@@ -98,6 +106,9 @@ var (
 
 func (l Logger) logger(ctx context.Context) *zap.Logger {
 	logger := l.ZapLogger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	if l.Context != nil {
 		fields := l.Context(ctx)
 		logger = logger.With(fields...)
