@@ -12,17 +12,25 @@
 
 ---
 
-## [Unreleased]
+## [v0.0.5] - 2026-09-22
+
+> 基线 `v0.0.4`。升级前请先阅读「不兼容变更」。
 
 ### 不兼容变更（Breaking）
 
-- **`cacheproxy.Init`**：签名变为 `func Init(rdb *redis.Client, opts ...Option) error`。`rdb == nil` 返回 `ErrNilRedis` 且不消耗 once；重复合法 Init 返回 `ErrAlreadyInitialized`。
+- **`cacheproxy.Init`**：签名变为 `func Init(rdb *redis.Client, opts ...Option) error`。`rdb == nil` 返回 `ErrNilRedis` 且不消耗 once，随后仍可再次 Init；重复的合法 Init 返回 `ErrAlreadyInitialized`。调用方必须处理返回值。
 
 ### 行为变更
 
-- **`httpclient` 失败错误文本**：`failedRequest` 不再把 response body 拼进 `error.Error()`，仅保留 `status=`（日志字段里的 response 不变）。
+- **`httpclient` 失败错误文本**：`failedRequest` 不再把 response body 拼进 `error.Error()`，仅保留 `status=`。日志字段里的 response 不变。
 - **`httpclient` 连接上限**：默认每主机最多 256 条在途连接（`Transport.MaxConnsPerHost`）；`DalHttpClientConf.MaxConnsPerHost > 0` 时可覆盖。
-- **`GetWithRetry` 重试**：仅对 429 / 500 / 502 / 503 / 504 重试（501 等其它 5xx 不再重试）；429 / 503 会参考 `Retry-After`（与现有 backoff 取较大者，最多 30 秒）。
+- **`GetWithRetry` 重试**：仅对 429 / 500 / 502 / 503 / 504 重试（501 等其它 5xx 不再重试）。429 / 503 会参考 `Retry-After`，与现有 backoff 取较大者，最多等待 30 秒。
+- **重定向**：仍然跟随，最多 10 次。跨主机跳转时额外去掉 `X-Api-Key`。`Authorization` 与 `Cookie` 仍由标准库在跨主机时剥离。
+- **非 2xx 响应体**：读取上限为 256KiB，超出部分不进入日志；成功响应仍最多读取 10MB。
+- **已取消的缓存回源**：进入 `GetHit` 时 `ctx` 已取消则不再启动回源。结果已经就绪时返回结果，而不是 `context.Canceled`。
+- **访问日志**：同一请求的多条 gin 错误合并为一条，`msg` 仍是第一条错误文本，全部错误在 `errors` 字段。
+- **日志轮转**：单次轮转 panic 后，按小时轮转的循环继续运行。
+- **NATS**：连接异步错误（如 slow consumer）写入日志。
 
 ---
 
