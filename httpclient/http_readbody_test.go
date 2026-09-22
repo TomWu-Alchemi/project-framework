@@ -1,6 +1,6 @@
 package httpclient
 
-// A5 验收测试：GetWithRetry 在 readLimitedBody 失败（非 MaxBytesError）的
+// A5 验收测试：GetWithRetry 在 readResponseBody 失败（非 MaxBytesError）的
 // 重试路径上补一条 Warn。与 TestGetWithRetry_NetworkErrorWarnsBeforeRetry
 // （Do 出错路径）区分：本用例的 Do 成功，仅 body 读取报错。
 

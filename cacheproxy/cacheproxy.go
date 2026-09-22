@@ -57,8 +57,9 @@ var (
 	// Load() 为 nil 表示尚未 Init，ready() 对 nil 做防御。
 	defaultProxyPtr atomic.Pointer[CacheProxy]
 
-	fastRequeryErr    = errors.New("need fast requery")
-	ErrNotInitialized = errors.New("cacheproxy: not initialized, call Init first")
+	fastRequeryErr        = errors.New("need fast requery")
+	ErrNotInitialized     = errors.New("cacheproxy: not initialized, call Init first")
+	ErrAlreadyInitialized = errors.New("cacheproxy: already initialized")
 )
 
 // options 是 CacheProxy 的构造选项聚合体（F-9）。新增选项时在 WithXxx 中归一化后再写入。
@@ -117,12 +118,26 @@ type CacheContext struct {
 	EmptyExpiredTime  time.Duration
 }
 
-// Init 初始化全局代理。变参 opts 向后兼容：既有调用 Init(rdb) 行为不变。
-// once 语义保留（P3-2）：仅第一次调用生效；测试如需自定义配置，请用 newCacheProxy 内部构造。
-func Init(rdb *redis.Client, opts ...Option) {
+// Init 初始化全局代理。rdb == nil 时返回 ErrNilRedis，且不消耗 once，随后仍可合法 Init。
+// 合法第一次写入代理；之后若发现本次创建的对象未被 Store，返回 ErrAlreadyInitialized。
+func Init(rdb *redis.Client, opts ...Option) error {
+	if rdb == nil {
+		return ErrNilRedis
+	}
+	proxy := newCacheProxy(rdb, opts...)
 	once.Do(func() {
-		defaultProxyPtr.Store(newCacheProxy(rdb, opts...))
+		defaultProxyPtr.Store(proxy)
 	})
+	if defaultProxyPtr.Load() != proxy {
+		return ErrAlreadyInitialized
+	}
+	return nil
+}
+
+// resetInit 仅供包内测试重置全局 Init 状态。不要在生产路径调用。
+func resetInit() {
+	once = sync.Once{}
+	defaultProxyPtr.Store(nil)
 }
 
 func GetInstance() *CacheProxy {
@@ -335,6 +350,9 @@ func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleG
 	// context.DeadlineExceeded —— 该错误由 singleflight 共享给仍在等待的调用方。
 	// 已因自身 ctx 取消而返回的调用方不受影响。取消等待者时不 Forget(key)，
 	// 以免拆掉仍在执行的共享 flight。
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	timeout := durationOrDefault(p.fetchTimeout, defaultFetchTimeout)
 	ch := p.getGroup.DoChan(key, func() (out any, retErr error) {
 		// F-22：getter 是业务方注入的外部依赖，panic 在此收敛为 error。
@@ -360,22 +378,36 @@ func (p *CacheProxy) getResource(ctx context.Context, key string, getter SingleG
 		}
 		return data, nil
 	})
+	return awaitFlight(ctx, ch)
+}
+
+// awaitFlight 等待 singleflight 结果；调用方 ctx 取消时若结果通道已有缓冲结果则优先返回结果。
+func awaitFlight(ctx context.Context, ch <-chan singleflight.Result) (string, bool, error) {
 	select {
 	case <-ctx.Done():
-		return "", false, ctx.Err()
+		select {
+		case r := <-ch:
+			return decodeFlightResult(r)
+		default:
+			return "", false, ctx.Err()
+		}
 	case r := <-ch:
-		if r.Err != nil && !errors.Is(r.Err, fastRequeryErr) {
-			return "", false, r.Err
-		}
-		res, ok := r.Val.(string)
-		if !ok {
-			return "", false, fmt.Errorf("cacheproxy: unexpected singleflight type %T", r.Val)
-		}
-		if errors.Is(r.Err, fastRequeryErr) {
-			return res, true, nil
-		}
-		return res, false, nil
+		return decodeFlightResult(r)
 	}
+}
+
+func decodeFlightResult(r singleflight.Result) (string, bool, error) {
+	if r.Err != nil && !errors.Is(r.Err, fastRequeryErr) {
+		return "", false, r.Err
+	}
+	res, ok := r.Val.(string)
+	if !ok {
+		return "", false, fmt.Errorf("cacheproxy: unexpected singleflight type %T", r.Val)
+	}
+	if errors.Is(r.Err, fastRequeryErr) {
+		return res, true, nil
+	}
+	return res, false, nil
 }
 
 func (p *CacheProxy) setData(ctx context.Context, c CacheContext, key string, data string, needFastRequery bool) error {

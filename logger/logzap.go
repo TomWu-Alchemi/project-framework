@@ -243,10 +243,10 @@ func GinzapWithConfig(logger ZapLogger, conf *Config) gin.HandlerFunc {
 			}
 
 			if len(c.Errors) > 0 {
-				// Append error field if this is an erroneous request.
-				for _, e := range c.Errors.Errors() {
-					logger.Error(e, fields...)
-				}
+				// 多条 gin 错误合并为一条日志，避免 body/header 重复 N 遍。
+				msgs := c.Errors.Errors()
+				fields = append(fields, zap.Strings("errors", msgs))
+				logger.Error(msgs[0], fields...)
 			} else if ll, ok := logger.(levelLogger); ok {
 				// Exact level: *zap.Logger satisfies levelLogger natively, so
 				// this branch is byte-for-byte the old *zap.Logger behavior.

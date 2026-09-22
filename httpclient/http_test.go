@@ -44,6 +44,9 @@ func TestNewDalHttpClient_ClonesDefaultTransport(t *testing.T) {
 	if tr.MaxIdleConnsPerHost != 100 {
 		t.Fatalf("MaxIdleConnsPerHost=%d", tr.MaxIdleConnsPerHost)
 	}
+	if tr.MaxConnsPerHost != defaultMaxConnsPerHost {
+		t.Fatalf("MaxConnsPerHost=%d, want %d", tr.MaxConnsPerHost, defaultMaxConnsPerHost)
+	}
 }
 
 func TestNewDalHttpClient_DefaultTimeout(t *testing.T) {
@@ -132,8 +135,9 @@ func TestPostJson_NilRespSkipsUnmarshal(t *testing.T) {
 }
 
 func TestPostJson_Non2xxWrapsErrFailedRequest(t *testing.T) {
+	const secret = "ERR-BODY-SECRET-7f3a"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "bad-body", http.StatusBadRequest)
+		http.Error(w, secret, http.StatusInternalServerError)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -141,8 +145,11 @@ func TestPostJson_Non2xxWrapsErrFailedRequest(t *testing.T) {
 	if !errors.Is(err, ErrFailedRequest) {
 		t.Fatalf("got %v", err)
 	}
-	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "bad-body") {
-		t.Fatalf("error missing status/body: %v", err)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("error must not contain response body: %v", err)
+	}
+	if !strings.Contains(err.Error(), "status=500") {
+		t.Fatalf("error missing status: %v", err)
 	}
 }
 
@@ -320,6 +327,9 @@ func TestGetWithRetry_NetworkErrorWarnsBeforeRetry(t *testing.T) {
 	// to be present with a non-empty rendered value.
 	if s := fmt.Sprint(got["error"]); s == "" {
 		t.Fatalf("error field missing or empty: %v", got)
+	}
+	if path, _ := got["path"].(string); path == "" {
+		t.Fatalf("path field missing or empty: %v", got)
 	}
 }
 

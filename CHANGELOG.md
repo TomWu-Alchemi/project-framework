@@ -12,6 +12,20 @@
 
 ---
 
+## [Unreleased]
+
+### 不兼容变更（Breaking）
+
+- **`cacheproxy.Init`**：签名变为 `func Init(rdb *redis.Client, opts ...Option) error`。`rdb == nil` 返回 `ErrNilRedis` 且不消耗 once；重复合法 Init 返回 `ErrAlreadyInitialized`。
+
+### 行为变更
+
+- **`httpclient` 失败错误文本**：`failedRequest` 不再把 response body 拼进 `error.Error()`，仅保留 `status=`（日志字段里的 response 不变）。
+- **`httpclient` 连接上限**：默认每主机最多 256 条在途连接（`Transport.MaxConnsPerHost`）；`DalHttpClientConf.MaxConnsPerHost > 0` 时可覆盖。
+- **`GetWithRetry` 重试**：仅对 429 / 500 / 502 / 503 / 504 重试（501 等其它 5xx 不再重试）；429 / 503 会参考 `Retry-After`（与现有 backoff 取较大者，最多 30 秒）。
+
+---
+
 ## [v0.0.4] - 2026-09-20
 
 > 基线 `v0.0.3`。升级前请先阅读「不兼容变更」与「迁移清单」。

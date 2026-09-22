@@ -43,6 +43,12 @@ var (
 // loggerRuntime 聚合单次初始化需要回收的全部资源。
 type loggerRuntime struct {
 	writers []*lumberjack.Logger
+	// rotateOne 默认 nil => rotateIfNotEmpty；测试可替换。
+	rotateOne func(*lumberjack.Logger)
+	// sleepAfterPanic 默认 nil => time.Sleep；测试可替换以免满睡 1s。
+	sleepAfterPanic func(time.Duration)
+	// untilNextRotate 默认 nil => 等到下一整点；测试可返回极短时长。
+	untilNextRotate func() time.Duration
 	// buffers 汇总本次初始化创建的全部文件侧缓冲（info/error/access/panic/dal 各自独立一个）。
 	// BufferSize<=0（含 InitLogger 默认路径）时为空切片。stop() 必须严格「先 Stop buffers、
 	// 后 Close writers」，否则未 flush 的数据会写向已关闭的 writer。
@@ -86,29 +92,50 @@ func (rt *loggerRuntime) stop() {
 // rotateLoop 每小时整点强制切分所有日志文件；Shutdown 通过 rotateDone 停止它。
 func (rt *loggerRuntime) rotateLoop() {
 	defer close(rt.rotateExited)
+	for {
+		if rt.rotateOnce() {
+			return
+		}
+	}
+}
+
+func (rt *loggerRuntime) rotateOnce() (stop bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			Errorf("panic in log rotating: %v, stack: %s", r, debug.Stack())
+			sleep := rt.sleepAfterPanic
+			if sleep == nil {
+				sleep = time.Sleep
+			}
+			sleep(time.Second)
 		}
 	}()
-	for {
+
+	var wait time.Duration
+	if rt.untilNextRotate != nil {
+		wait = rt.untilNextRotate()
+	} else {
 		now := time.Now()
 		next := now.Add(time.Hour)
 		next = time.Date(next.Year(), next.Month(), next.Day(), next.Hour(), 0, 0, 0, next.Location())
-
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-rt.rotateDone:
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-
-		// 强制切分所有日志文件
-		for _, w := range rt.writers {
-			rotateIfNotEmpty(w)
-		}
+		wait = time.Until(next)
 	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-rt.rotateDone:
+		return true
+	case <-timer.C:
+	}
+
+	rotate := rt.rotateOne
+	if rotate == nil {
+		rotate = rotateIfNotEmpty
+	}
+	for _, w := range rt.writers {
+		rotate(w)
+	}
+	return false
 }
 
 // LoggerConfig 控制 InitLoggerWithConfig 的编码、目录、stdout 与压缩。
