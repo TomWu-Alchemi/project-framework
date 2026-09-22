@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,10 +20,12 @@ import (
 )
 
 const (
-	maxResponseBytes = 10 << 20
-	retryBaseDelay   = 50 * time.Millisecond
-	retryMaxDelay    = 2 * time.Second
-	defaultTimeout   = 10 * time.Second
+	maxResponseBytes       = 10 << 20
+	retryBaseDelay         = 50 * time.Millisecond
+	retryMaxDelay          = 2 * time.Second
+	defaultTimeout         = 10 * time.Second
+	defaultMaxConnsPerHost = 256
+	maxRetryAfter          = 30 * time.Second
 )
 
 type DalHttpClient struct {
@@ -32,6 +35,8 @@ type DalHttpClient struct {
 
 type DalHttpClientConf struct {
 	Timeout time.Duration
+	// MaxConnsPerHost 限制每个主机的最大在途连接数。<=0 时使用 defaultMaxConnsPerHost（256）。
+	MaxConnsPerHost int
 	// DalLog 为 DAL 日志器（记录本条请求的全量 path/header/data/response）。
 	// nil 表示**不记录任何 DAL 日志**：这是显式 opt-in 设计——DAL 日志是全量
 	// 请求/响应记录，未注入时既不产生日志，也不占用全局日志通道（本字段与
@@ -47,6 +52,10 @@ var (
 func NewDalHttpClient(conf DalHttpClientConf) *DalHttpClient {
 	if conf.Timeout <= 0 {
 		conf.Timeout = defaultTimeout
+	}
+	maxConns := conf.MaxConnsPerHost
+	if maxConns <= 0 {
+		maxConns = defaultMaxConnsPerHost
 	}
 	// F-26：宿主可能替换 http.DefaultTransport（测试注入 / APM 仪器化的常见做法），
 	// 硬类型断言会让构造直接 panic。ok 断言失败时兜底自建 Transport，
@@ -66,18 +75,45 @@ func NewDalHttpClient(conf DalHttpClientConf) *DalHttpClient {
 	t.MaxIdleConns = 100
 	t.MaxIdleConnsPerHost = 100
 	t.IdleConnTimeout = 60 * time.Second
+	t.MaxConnsPerHost = maxConns
 	return &DalHttpClient{
-		httpClient: &http.Client{Timeout: conf.Timeout, Transport: t},
-		dalLog:     conf.DalLog,
+		httpClient: &http.Client{
+			Timeout:       conf.Timeout,
+			Transport:     t,
+			CheckRedirect: checkRedirect,
+		},
+		dalLog: conf.DalLog,
 	}
+}
+
+// checkRedirect 最多跟随 10 次；跨主机时删除 X-Api-Key（Authorization/Cookie 等仍由标准库剥离）。
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if len(via) > 0 && req.URL.Hostname() != via[0].URL.Hostname() {
+		req.Header.Del("X-Api-Key")
+	}
+	return nil
 }
 
 func isSuccessStatus(code int) bool {
 	return code >= 200 && code < 300
 }
 
+// isRetryableStatus 仅对可能瞬时的状态码重试：429 / 500 / 502 / 503 / 504。
+// 501、505 及其它未列出的 5xx 不重试。
 func isRetryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code >= 500
+	switch code {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 func retryBackoff(attempt int) time.Duration {
@@ -95,8 +131,51 @@ func retryBackoff(attempt int) time.Duration {
 	return backoff
 }
 
-func waitRetry(ctx context.Context, attempt int) error {
-	timer := time.NewTimer(retryBackoff(attempt))
+func parseRetryAfter(v string) (time.Duration, bool) {
+	if v == "" {
+		return 0, false
+	}
+	if sec, err := strconv.Atoi(v); err == nil {
+		if sec < 0 {
+			return 0, true
+		}
+		return time.Duration(sec) * time.Second, true
+	}
+	t, err := time.Parse(http.TimeFormat, v)
+	if err != nil {
+		return 0, false
+	}
+	d := time.Until(t)
+	if d < 0 {
+		d = 0
+	}
+	return d, true
+}
+
+// combineRetryWait 将 backoff 与（可选的）Retry-After 合并并封顶，便于单测且不 sleep。
+func combineRetryWait(backoff time.Duration, status int, retryAfter string) time.Duration {
+	wait := backoff
+	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
+		if d, ok := parseRetryAfter(retryAfter); ok && d > wait {
+			wait = d
+		}
+	}
+	if wait > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return wait
+}
+
+func retryWait(resp *http.Response, attempt int) time.Duration {
+	backoff := retryBackoff(attempt)
+	if resp == nil {
+		return combineRetryWait(backoff, 0, "")
+	}
+	return combineRetryWait(backoff, resp.StatusCode, resp.Header.Get("Retry-After"))
+}
+
+func waitRetry(ctx context.Context, wait time.Duration) error {
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -123,15 +202,19 @@ func ctxErrWithLast(ctxErr, lastErr error) error {
 	return fmt.Errorf("%w (last err: %w)", ctxErr, lastErr)
 }
 
-func readLimitedBody(resp *http.Response) ([]byte, error) {
+// readResponseBody 成功响应最多 maxResponseBytes（MaxBytesReader）；非 2xx 最多
+// logutil.MaxLogBytes（LimitReader，超限不返回 MaxBytesError）。
+func readResponseBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
-	resp.Body = http.MaxBytesReader(nil, resp.Body, maxResponseBytes)
-	return io.ReadAll(resp.Body)
+	if isSuccessStatus(resp.StatusCode) {
+		resp.Body = http.MaxBytesReader(nil, resp.Body, maxResponseBytes)
+		return io.ReadAll(resp.Body)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, int64(logutil.MaxLogBytes)))
 }
 
-func failedRequest(status int, body []byte) error {
-	logged, _, _ := logutil.TruncateBytes(body)
-	return fmt.Errorf("%w: status=%d body=%s", ErrFailedRequest, status, logged)
+func failedRequest(status int) error {
+	return fmt.Errorf("%w: status=%d", ErrFailedRequest, status)
 }
 
 func wrapReadBody(err error) error {
@@ -200,7 +283,7 @@ func (c *DalHttpClient) PostJson(ctx context.Context, rawURL string, headers map
 		return err
 	}
 
-	bodyBytes, err := readLimitedBody(rawResponse)
+	bodyBytes, err := readResponseBody(rawResponse)
 	if err != nil {
 		return wrapReadBody(err)
 	}
@@ -217,7 +300,7 @@ func (c *DalHttpClient) PostJson(ctx context.Context, rawURL string, headers map
 
 	if !isSuccessStatus(rawResponse.StatusCode) {
 		c.warn("PostJson", logFields...)
-		return failedRequest(rawResponse.StatusCode, bodyBytes)
+		return failedRequest(rawResponse.StatusCode)
 	}
 	c.info("PostJson", logFields...)
 	if resp == nil || rawResponse.StatusCode == http.StatusNoContent || len(bodyBytes) == 0 {
@@ -227,7 +310,7 @@ func (c *DalHttpClient) PostJson(ctx context.Context, rawURL string, headers map
 }
 
 // GetWithRetry issues a GET request and retries on network errors and
-// retryable statuses (429 / 5xx).
+// retryable statuses (429 / 500 / 502 / 503 / 504).
 //
 // maxAttempts is the total number of attempts, not the number of extra
 // retries: values below 1 are treated as a single attempt. When all attempts
@@ -286,18 +369,20 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 			// The network-error retry path used to be completely silent
 			// (P3-4): warn once per retried attempt so operators can see the
 			// failed attempt (1-based), its latency and the underlying error.
-			c.warn("GetWithRetry",
+			warnFields := []zap.Field{
 				zap.Int("attempt", i+1),
 				zap.Int64("latency_ms", latency),
 				zap.Error(err),
-			)
-			if waitErr := waitRetry(ctx, i); waitErr != nil {
+			}
+			warnFields = append(warnFields, logutil.ZapTruncatedString("path", fullURL)...)
+			c.warn("GetWithRetry", warnFields...)
+			if waitErr := waitRetry(ctx, retryWait(nil, i)); waitErr != nil {
 				return nil, ctxErrWithLast(waitErr, lastErr)
 			}
 			continue
 		}
 
-		bodyBytes, err := readLimitedBody(resp)
+		bodyBytes, err := readResponseBody(resp)
 		if err != nil {
 			// MaxBytesError 不是瞬时故障：响应体已确定超限，重试也不会变小，
 			// 因此保持「立即返回、不打日志」。
@@ -310,12 +395,14 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 			}
 			// 与网络错误重试路径（P3-4）同级：重试前 Warn 一次，字段同款
 			// （attempt / latency_ms / error），避免这条 body 读取失败的重试路径静默。
-			c.warn("GetWithRetry",
+			warnFields := []zap.Field{
 				zap.Int("attempt", i+1),
 				zap.Int64("latency_ms", latency),
 				zap.Error(err),
-			)
-			if waitErr := waitRetry(ctx, i); waitErr != nil {
+			}
+			warnFields = append(warnFields, logutil.ZapTruncatedString("path", fullURL)...)
+			c.warn("GetWithRetry", warnFields...)
+			if waitErr := waitRetry(ctx, retryWait(nil, i)); waitErr != nil {
 				return nil, ctxErrWithLast(waitErr, lastErr)
 			}
 			continue
@@ -329,7 +416,7 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 		logFields = append(logFields, logutil.ZapTruncatedString("path", fullURL)...)
 		logFields = append(logFields, logutil.ZapTruncatedString("header", headerStr)...)
 		logFields = append(logFields, logutil.ZapTruncatedBytes("response", bodyBytes)...)
-		// F-27：重试类失败状态（429/5xx）与网络错误路径（P3-4）同为 Warn 级，
+		// F-27：重试类失败状态与网络错误路径（P3-4）同为 Warn 级，
 		// 便于基于级别的告警捕捉重试风暴；成功与其余 4xx 保持 Info。
 		if isRetryableStatus(resp.StatusCode) {
 			c.warn("GetWithRetry", logFields...)
@@ -341,14 +428,14 @@ func (c *DalHttpClient) GetWithRetry(ctx context.Context, baseUrl string, params
 			return bodyBytes, nil
 		}
 
-		lastErr = failedRequest(resp.StatusCode, bodyBytes)
+		lastErr = failedRequest(resp.StatusCode)
 		if !isRetryableStatus(resp.StatusCode) {
 			return nil, lastErr
 		}
 		if i == attempts-1 {
 			break
 		}
-		if waitErr := waitRetry(ctx, i); waitErr != nil {
+		if waitErr := waitRetry(ctx, retryWait(resp, i)); waitErr != nil {
 			return nil, ctxErrWithLast(waitErr, lastErr)
 		}
 	}

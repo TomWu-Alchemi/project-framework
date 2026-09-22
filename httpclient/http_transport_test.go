@@ -37,6 +37,9 @@ func TestNewDalHttpClient_ReplacedDefaultTransportNoPanic(t *testing.T) {
 	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 100 || tr.IdleConnTimeout != 60*time.Second {
 		t.Fatalf("connection pool tuning not applied: %+v", tr)
 	}
+	if tr.MaxConnsPerHost != defaultMaxConnsPerHost {
+		t.Fatalf("MaxConnsPerHost=%d, want %d", tr.MaxConnsPerHost, defaultMaxConnsPerHost)
+	}
 	if tr.Proxy == nil {
 		t.Fatal("fallback transport must honor proxy env")
 	}

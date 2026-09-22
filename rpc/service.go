@@ -39,6 +39,7 @@ func connectOptions(config ServiceConfig) []nats.Option {
 		nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
 			logErrorf(log, "nats rpc disconnect error occur, err(%v)", err)
 		}),
+		nats.ErrorHandler(asyncErrorHandler(log)),
 	}
 	// F-32：空账号不显式传 UserInfo，避免空值覆盖 URL 内嵌凭据的语义歧义
 	if config.Username != "" || config.Password != "" {
@@ -48,6 +49,16 @@ func connectOptions(config ServiceConfig) []nats.Option {
 		options = append(options, nats.DrainTimeout(config.DrainTimeout))
 	}
 	return options
+}
+
+func asyncErrorHandler(log *zap.Logger) nats.ErrHandler {
+	return func(_ *nats.Conn, sub *nats.Subscription, err error) {
+		subject := ""
+		if sub != nil {
+			subject = sub.Subject
+		}
+		logErrorf(log, "nats async error, subject(%s) err(%v)", subject, err)
+	}
 }
 
 // drainWaitBudget returns the maximum time cleanup waits for the connection's
